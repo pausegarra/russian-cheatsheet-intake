@@ -31,7 +31,7 @@ Read these tables:
 
 Use bare source text throughout: `words.bare` and `words_forms.form_bare`, never `accented` or `form`. Preserve text exactly; do not trim or normalize Unicode. If multiple form rows share a `form_type`, sort by `position` and join `form_bare` values with `; ` because API form values are single strings. If a word has no form rows, send `forms: null`; when forms exist, send the full API forms object with absent fields set to null.
 
-Send an empty translations array when a word has no English translations. Keep source positions. Reject unknown word types or form types instead of silently mapping or dropping them.
+Send an empty translations array when a word has no English translations. Keep source positions in API data for display, but exclude them from the checksum. Reject unknown word types or form types instead of silently mapping or dropping them.
 
 ## API synchronization
 
@@ -50,9 +50,9 @@ Use the existing bearer token from environment configuration for the API's `word
 
 ## Checksum contract
 
-Keep one global API `checksum`; define it as the canonical checksum of OpenRussian-managed word fields. Relations have dedicated endpoints and must not affect this checksum. For compatibility with checksums already calculated for words without relations, retain a constant `relations: []` property in the canonical JSON; never load actual relation rows into it. Relation creation/deletion must not refresh a word checksum.
+Keep one global API `checksum`; define it as the canonical checksum of OpenRussian-managed word fields. Relations have dedicated endpoints and must not affect this checksum. Relation creation/deletion must not refresh a word checksum.
 
-The Rust implementation must match the API's canonical word payload. It includes `russian`, `type`, imported translations, `usage`, `audioUrl`, `aspect`, and `forms`, plus the constant empty relations array above. It serializes compact UTF-8 JSON with sorted property names and null values included, then calculates lowercase SHA-256 hex. Imported translations sort by language, position, then text. The hash does not include `externalId`, API UUID, audit timestamps, publication state, actual relation rows, or the checksum itself.
+The Rust implementation must match the API's canonical word payload. It includes `russian`, `type`, imported translations, `usage`, `audioUrl`, `aspect`, and `forms`; it excludes relations. Each checksum translation contains only `language` and `text`; position remains in stored API data but is not hashed. Sort checksum translations by language, then text, preserving duplicate entries. Serialize compact UTF-8 JSON with sorted property names and null values included, then calculate lowercase SHA-256 hex. The hash does not include `externalId`, API UUID, audit timestamps, publication state, relations, translation positions, or the checksum itself.
 
 For this version, the expected API projection is:
 
@@ -64,7 +64,7 @@ For this version, the expected API projection is:
 - `usage`: null
 - `audioUrl`: null
 
-Manual translations are preserved by the API and excluded from its checksum. Relations remain independently managed and can change without changing a word checksum. Existing rows with outgoing relations will get a new checksum once; rows with no relations retain the existing canonical shape. The v1 importer assumes managed OpenRussian records have null usage/audio; if these fields are populated, the current imported-word update replaces them with request values. Keep them null consistently in v1, or include their OpenRussian source values in the import later.
+Manual translations are preserved by the API and excluded from its checksum. Relations remain independently managed and can change without changing a word checksum. A translation position-only change will not trigger an update; displayed translation ordering may therefore remain unchanged. Existing checksums use relation values and translation positions, so reset checksums for imported rows once; the next intake run recalculates them. The v1 importer assumes managed OpenRussian records have null usage/audio; if these fields are populated, the current imported-word update replaces them with request values. Keep them null consistently in v1, or include their OpenRussian source values in the import later.
 
 ## Error handling and reporting
 
