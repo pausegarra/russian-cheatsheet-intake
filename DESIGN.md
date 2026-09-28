@@ -10,7 +10,7 @@ Create a Rust CLI that synchronizes active OpenRussian words into the Russian Ch
 
 - Import `words.bare`, source word type, verb aspect, English translations, and bare word forms.
 - Read public OpenRussian data through TogetherDB; no PostgreSQL/MySQL DSN required.
-- Create missing API words and update existing imported words when their canonical checksum differs.
+- Create missing API words and update existing imported words when the API's global word checksum differs.
 - Skip disabled OpenRussian rows. Never delete API words.
 - Do not generate Spanish translations in this version.
 - Do not import examples, relations, usage text, or audio URLs in this version.
@@ -50,7 +50,9 @@ Use the existing bearer token from environment configuration for the API's `word
 
 ## Checksum contract
 
-The Rust implementation must match `WordChecksumService` exactly. Its canonical word includes `russian`, `type`, imported translations, `usage`, `audioUrl`, `aspect`, `forms`, and outgoing relations. It serializes compact UTF-8 JSON with sorted property names and null values included, then calculates lowercase SHA-256 hex. Imported translations sort by language, position, then text. The hash does not include `externalId`, API UUID, audit timestamps, publication state, or the checksum itself.
+Keep one global API `checksum`; define it as the canonical checksum of OpenRussian-managed word fields. Relations have dedicated endpoints and must not affect this checksum. Relation creation/deletion must not refresh a word checksum. This avoids changing or clearing relations when the word importer updates source data.
+
+The Rust implementation must match the API's canonical word payload. It includes `russian`, `type`, imported translations, `usage`, `audioUrl`, `aspect`, and `forms`; excludes relations. It serializes compact UTF-8 JSON with sorted property names and null values included, then calculates lowercase SHA-256 hex. Imported translations sort by language, position, then text. The hash does not include `externalId`, API UUID, audit timestamps, publication state, or the checksum itself.
 
 For this version, the expected API projection is:
 
@@ -61,9 +63,8 @@ For this version, the expected API projection is:
 - `forms`: mapped bare forms, or null if none
 - `usage`: null
 - `audioUrl`: null
-- `relations`: empty list
 
-Manual translations are preserved by the API and excluded from its checksum. The importer assumes OpenRussian records it manages have null usage/audio and no outgoing API relations. If another writer populates those fields, the full API checksum can remain different from this importer projection; an update can also clear usage/audio. Before such records are in scope, add an API checksum specifically for importer-managed fields or expand the importer to own those fields. Do not clear relations to force a checksum match.
+Manual translations are preserved by the API and excluded from its checksum. Relations remain independently managed and can change without changing a word checksum. The v1 importer assumes managed OpenRussian records have null usage/audio; if these fields are populated, the current imported-word update replaces them with request values. Keep them null consistently in v1, or include their OpenRussian source values in the import later. Existing checksums calculated with relations included need a one-time recalculation when the API checksum definition changes.
 
 ## Error handling and reporting
 
