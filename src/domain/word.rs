@@ -130,6 +130,13 @@ impl ImportedWord {
             audio_url: self.audio_url.as_deref(),
         }
     }
+
+    pub fn update_request<'a>(&'a self, id: &'a str) -> WordUpdateRequest<'a> {
+        WordUpdateRequest {
+            id,
+            word: self.request(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -144,6 +151,14 @@ pub struct WordWriteRequest<'a> {
     pub translations: Vec<TranslationRequest<'a>>,
     pub usage: Option<&'a str>,
     pub audio_url: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WordUpdateRequest<'a> {
+    pub id: &'a str,
+    #[serde(flatten)]
+    pub word: WordWriteRequest<'a>,
 }
 
 #[derive(Serialize)]

@@ -53,6 +53,13 @@ impl ImportedExample {
             linked_word_ids: &self.linked_word_ids,
         }
     }
+
+    pub fn update_request<'a>(&'a self, id: &'a str) -> ExampleUpdateRequest<'a> {
+        ExampleUpdateRequest {
+            id,
+            example: self.request(false),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -65,4 +72,12 @@ pub struct ExampleWriteRequest<'a> {
     pub contributor: Option<&'a str>,
     pub audio_url: Option<&'a str>,
     pub linked_word_ids: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExampleUpdateRequest<'a> {
+    pub id: &'a str,
+    #[serde(flatten)]
+    pub example: ExampleWriteRequest<'a>,
 }

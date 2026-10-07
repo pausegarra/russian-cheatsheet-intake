@@ -108,6 +108,16 @@ pub trait WordSource {
 pub trait WordsApi {
     fn find_all_by_external_id(&self) -> Result<HashMap<String, ApiWord>>;
 
+    fn create_batch(
+        &self,
+        words: &[ImportedWord],
+    ) -> std::result::Result<Vec<ApiWord>, ApiWriteError>;
+
+    fn update_batch(
+        &self,
+        updates: &[(ApiWord, ImportedWord)],
+    ) -> std::result::Result<Vec<ApiWord>, ApiWriteError>;
+
     fn create(&self, word: &ImportedWord) -> std::result::Result<WriteResult, ApiWriteError>;
 
     fn update(
@@ -119,6 +129,16 @@ pub trait WordsApi {
 
 pub trait ExamplesApi {
     fn find_all_examples_by_external_id(&self) -> Result<HashMap<String, ApiExample>>;
+
+    fn create_examples_batch(
+        &self,
+        examples: &[ImportedExample],
+    ) -> std::result::Result<Vec<ApiExample>, ApiWriteError>;
+
+    fn update_examples_batch(
+        &self,
+        updates: &[(ApiExample, ImportedExample)],
+    ) -> std::result::Result<Vec<ApiExample>, ApiWriteError>;
 
     fn create_example(
         &self,

@@ -8,7 +8,7 @@ use crate::infrastructure::keycloak::JwtKeycloakContextHolder;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::{Method, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,6 +182,92 @@ impl CheatsheetApi {
             "Russian Cheatsheet API example read complete"
         );
         Ok(examples)
+    }
+
+    fn send_batch_request<T: Serialize>(
+        &self,
+        method: Method,
+        url: Url,
+        request: &T,
+        resource: &'static str,
+        retry_rate_limits: bool,
+    ) -> std::result::Result<reqwest::blocking::Response, ApiWriteError> {
+        let mut rate_limit_retries = 0;
+        let response = loop {
+            let token = self.keycloak.get_token().map_err(api_error)?;
+            let response = self
+                .http
+                .request(method.clone(), url.clone())
+                .bearer_auth(token)
+                .json(request)
+                .send()
+                .map_err(|error| ApiWriteError {
+                    message: format!("request failed: {error}"),
+                    outcome_unknown: error.is_timeout() || error.is_connect(),
+                    fatal: false,
+                })?;
+
+            if !retry_rate_limits
+                || response.status() != StatusCode::TOO_MANY_REQUESTS
+                || rate_limit_retries >= MAX_RATE_LIMIT_RETRIES
+            {
+                break response;
+            }
+
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|header| header.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let fallback_delay =
+                Duration::from_secs(1u64 << rate_limit_retries).min(MAX_RATE_LIMIT_DELAY);
+            let delay = retry_after
+                .map(Duration::from_secs)
+                .unwrap_or(fallback_delay);
+            warn!(
+                resource,
+                retry = rate_limit_retries + 1,
+                delay_seconds = delay.as_secs(),
+                "Batch write was rate limited; retrying"
+            );
+            std::thread::sleep(delay);
+            rate_limit_retries += 1;
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .unwrap_or_else(|error| format!("<could not read body: {error}>"));
+            return Err(ApiWriteError {
+                message: format!("API returned {status}: {body}"),
+                outcome_unknown: status == StatusCode::CONFLICT
+                    || status == StatusCode::REQUEST_TIMEOUT
+                    || status.is_server_error(),
+                fatal: status == StatusCode::UNAUTHORIZED
+                    || status == StatusCode::FORBIDDEN
+                    || status.is_server_error(),
+            });
+        }
+
+        Ok(response)
+    }
+
+    fn validate_batch_response_count(
+        &self,
+        resource: &str,
+        requested: usize,
+        received: usize,
+    ) -> std::result::Result<(), ApiWriteError> {
+        if requested == received {
+            return Ok(());
+        }
+
+        Err(ApiWriteError {
+            message: format!("API returned {received} {resource} for batch of {requested}"),
+            outcome_unknown: true,
+            fatal: true,
+        })
     }
 
     fn send_word(
@@ -430,6 +516,93 @@ impl WordsApi for CheatsheetApi {
         self.find_all()
     }
 
+    fn create_batch(
+        &self,
+        words: &[ImportedWord],
+    ) -> std::result::Result<Vec<ApiWord>, ApiWriteError> {
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests: Vec<_> = words.iter().map(ImportedWord::request).collect();
+        let response = self.send_batch_request(
+            Method::POST,
+            self.base_url
+                .join("words/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "words",
+            false,
+        )?;
+        let items: Vec<WordResponse> = response.json().map_err(|error| ApiWriteError {
+            message: format!("API returned an unreadable words batch response: {error}"),
+            outcome_unknown: true,
+            fatal: false,
+        })?;
+        self.validate_batch_response_count("words", words.len(), items.len())?;
+
+        words
+            .iter()
+            .zip(items)
+            .map(|(word, item)| {
+                self.checked_result(
+                    ApiWord {
+                        id: item.id,
+                        external_id: item.external_id.unwrap_or_default(),
+                        checksum: item.checksum,
+                    },
+                    word,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn update_batch(
+        &self,
+        updates: &[(ApiWord, ImportedWord)],
+    ) -> std::result::Result<Vec<ApiWord>, ApiWriteError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests: Vec<_> = updates
+            .iter()
+            .map(|(existing, word)| word.update_request(&existing.id))
+            .collect();
+        let response = self.send_batch_request(
+            Method::PUT,
+            self.base_url
+                .join("words/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "words",
+            false,
+        )?;
+        let items: Vec<WordResponse> = response.json().map_err(|error| ApiWriteError {
+            message: format!("API returned an unreadable words batch response: {error}"),
+            outcome_unknown: true,
+            fatal: false,
+        })?;
+        self.validate_batch_response_count("words", updates.len(), items.len())?;
+
+        updates
+            .iter()
+            .zip(items)
+            .map(|((existing, word), item)| {
+                self.checked_result(
+                    ApiWord {
+                        id: item.id,
+                        external_id: item.external_id.unwrap_or_default(),
+                        checksum: item.checksum,
+                    },
+                    word,
+                    Some(&existing.id),
+                )
+            })
+            .collect()
+    }
+
     fn create(&self, word: &ImportedWord) -> std::result::Result<WriteResult, ApiWriteError> {
         match self.send_word(Method::POST, self.word_url(None).map_err(api_error)?, word) {
             Ok(api_word) => {
@@ -509,6 +682,110 @@ impl WordsApi for CheatsheetApi {
 impl ExamplesApi for CheatsheetApi {
     fn find_all_examples_by_external_id(&self) -> Result<HashMap<String, ApiExample>> {
         self.find_all_examples()
+    }
+
+    fn create_examples_batch(
+        &self,
+        examples: &[ImportedExample],
+    ) -> std::result::Result<Vec<ApiExample>, ApiWriteError> {
+        if examples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests: Vec<_> = examples
+            .iter()
+            .map(|example| example.request(true))
+            .collect();
+        let response = self.send_batch_request(
+            Method::POST,
+            self.base_url
+                .join("examples/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "examples",
+            true,
+        )?;
+        let items: Vec<ExampleResponse> = response.json().map_err(|error| ApiWriteError {
+            message: format!("API returned an unreadable examples batch response: {error}"),
+            outcome_unknown: true,
+            fatal: false,
+        })?;
+        self.validate_batch_response_count("examples", examples.len(), items.len())?;
+
+        examples
+            .iter()
+            .zip(items)
+            .map(|(example, item)| {
+                let Some(external_id) = item.external_id else {
+                    return Err(ApiWriteError {
+                        message: "API returned an example without externalId".to_owned(),
+                        outcome_unknown: true,
+                        fatal: true,
+                    });
+                };
+                self.checked_example_result(
+                    ApiExample {
+                        id: item.id,
+                        external_id,
+                        checksum: item.checksum,
+                    },
+                    example,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn update_examples_batch(
+        &self,
+        updates: &[(ApiExample, ImportedExample)],
+    ) -> std::result::Result<Vec<ApiExample>, ApiWriteError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests: Vec<_> = updates
+            .iter()
+            .map(|(existing, example)| example.update_request(&existing.id))
+            .collect();
+        let response = self.send_batch_request(
+            Method::PUT,
+            self.base_url
+                .join("examples/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "examples",
+            true,
+        )?;
+        let items: Vec<ExampleResponse> = response.json().map_err(|error| ApiWriteError {
+            message: format!("API returned an unreadable examples batch response: {error}"),
+            outcome_unknown: true,
+            fatal: false,
+        })?;
+        self.validate_batch_response_count("examples", updates.len(), items.len())?;
+
+        updates
+            .iter()
+            .zip(items)
+            .map(|((existing, example), item)| {
+                let Some(external_id) = item.external_id else {
+                    return Err(ApiWriteError {
+                        message: "API returned an example without externalId".to_owned(),
+                        outcome_unknown: true,
+                        fatal: true,
+                    });
+                };
+                self.checked_example_result(
+                    ApiExample {
+                        id: item.id,
+                        external_id,
+                        checksum: item.checksum,
+                    },
+                    example,
+                    Some(&existing.id),
+                )
+            })
+            .collect()
     }
 
     fn create_example(
