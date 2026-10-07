@@ -134,7 +134,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                 }
             }
 
-            if creates.len() >= self.batch_size {
+            if creates.len() == self.batch_size {
                 let batch = std::mem::take(&mut creates);
                 if self.flush_creates(&batch, &mut existing, &mut summary) {
                     summary.failed += updates.len();
@@ -143,7 +143,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                     break;
                 }
             }
-            if updates.len() >= self.batch_size {
+            if updates.len() == self.batch_size {
                 let batch = std::mem::take(&mut updates);
                 if self.flush_updates(&batch, &mut existing, &mut summary) {
                     summary.failed += creates.len();
