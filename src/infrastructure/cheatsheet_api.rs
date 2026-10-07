@@ -554,6 +554,7 @@ impl WordsApi for CheatsheetApi {
                     word,
                     None,
                 )
+                .map_err(mark_batch_integrity_error)
             })
             .collect()
     }
@@ -599,6 +600,7 @@ impl WordsApi for CheatsheetApi {
                     word,
                     Some(&existing.id),
                 )
+                .map_err(mark_batch_integrity_error)
             })
             .collect()
     }
@@ -732,6 +734,7 @@ impl ExamplesApi for CheatsheetApi {
                     example,
                     None,
                 )
+                .map_err(mark_batch_integrity_error)
             })
             .collect()
     }
@@ -784,6 +787,7 @@ impl ExamplesApi for CheatsheetApi {
                     example,
                     Some(&existing.id),
                 )
+                .map_err(mark_batch_integrity_error)
             })
             .collect()
     }
@@ -835,6 +839,11 @@ fn api_error(error: anyhow::Error) -> ApiWriteError {
         outcome_unknown: false,
         fatal: true,
     }
+}
+
+fn mark_batch_integrity_error(mut error: ApiWriteError) -> ApiWriteError {
+    error.outcome_unknown = true;
+    error
 }
 
 #[derive(Deserialize)]
