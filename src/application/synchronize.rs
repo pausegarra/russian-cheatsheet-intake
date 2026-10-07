@@ -1,5 +1,5 @@
 use crate::application::ports::{
-    ApiWord, SourceForm, SourceSnapshot, SourceWord, WordSource, WordsApi, WriteEffect,
+    ApiWord, ApiWriteError, SourceForm, SourceSnapshot, SourceWord, WordSource, WordsApi,
 };
 use crate::domain::word::{ImportedWord, Translation, WORD_FORM_TYPES, WordForms};
 use anyhow::Result;
@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 pub struct SynchronizeWords<S, A> {
     source: S,
     api: A,
+    batch_size: usize,
 }
 
 #[derive(Default)]
@@ -37,8 +38,12 @@ enum PreparedWord {
 }
 
 impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
-    pub fn new(source: S, api: A) -> Self {
-        Self { source, api }
+    pub fn new(source: S, api: A, batch_size: usize) -> Self {
+        Self {
+            source,
+            api,
+            batch_size,
+        }
     }
 
     pub fn run_with_words(&self) -> Result<WordSyncResult> {
@@ -75,6 +80,10 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             "Russian Cheatsheet words loaded"
         );
 
+        let mut creates = Vec::new();
+        let mut updates = Vec::new();
+        let mut stop = false;
+
         for item in prepared {
             let word = match item {
                 PreparedWord::Ready(word) => word,
@@ -92,7 +101,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                 }
             };
 
-            let write = match existing.get(&word.external_id) {
+            match existing.get(&word.external_id) {
                 Some(api_word) if api_word.checksum.as_deref() == Some(word.checksum.as_str()) => {
                     info!(
                         external_id = %word.external_id,
@@ -112,7 +121,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                         expected_checksum = %word.checksum,
                         "Updating word in Russian Cheatsheet API"
                     );
-                    self.api.update(api_word, &word)
+                    updates.push((api_word.clone(), word));
                 }
                 None => {
                     info!(
@@ -121,47 +130,42 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                         expected_checksum = %word.checksum,
                         "Creating word in Russian Cheatsheet API"
                     );
-                    self.api.create(&word)
+                    creates.push(word);
                 }
-            };
+            }
 
-            match write {
-                Ok(result) => {
-                    match result.effect {
-                        WriteEffect::Created => {
-                            summary.created += 1;
-                            info!(
-                                external_id = %word.external_id,
-                                russian = %word.russian,
-                                api_word_id = %result.word.id,
-                                "Word created"
-                            );
-                        }
-                        WriteEffect::Updated => {
-                            summary.updated += 1;
-                            info!(
-                                external_id = %word.external_id,
-                                russian = %word.russian,
-                                api_word_id = %result.word.id,
-                                "Word updated"
-                            );
-                        }
-                    }
-                    existing.insert(word.external_id.clone(), result.word);
+            if creates.len() >= self.batch_size {
+                let batch = std::mem::take(&mut creates);
+                if self.flush_creates(&batch, &mut existing, &mut summary) {
+                    summary.failed += updates.len();
+                    updates.clear();
+                    stop = true;
+                    break;
                 }
-                Err(error) => {
-                    error!(
-                        external_id = %word.external_id,
-                        russian = %word.russian,
-                        error = %error.message,
-                        "Word synchronization failed"
-                    );
-                    summary.failed += 1;
-                    if error.fatal {
-                        summary.fatal_error = Some(error.message);
-                        break;
-                    }
+            }
+            if updates.len() >= self.batch_size {
+                let batch = std::mem::take(&mut updates);
+                if self.flush_updates(&batch, &mut existing, &mut summary) {
+                    summary.failed += creates.len();
+                    creates.clear();
+                    stop = true;
+                    break;
                 }
+            }
+        }
+
+        if !stop {
+            let batch = std::mem::take(&mut creates);
+            if !batch.is_empty() && self.flush_creates(&batch, &mut existing, &mut summary) {
+                summary.failed += updates.len();
+                updates.clear();
+                stop = true;
+            }
+        }
+        if !stop {
+            let batch = std::mem::take(&mut updates);
+            if !batch.is_empty() {
+                self.flush_updates(&batch, &mut existing, &mut summary);
             }
         }
 
@@ -169,6 +173,308 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             summary,
             words_by_external_id: existing,
         })
+    }
+
+    fn flush_creates(
+        &self,
+        batch: &[ImportedWord],
+        existing: &mut HashMap<String, ApiWord>,
+        summary: &mut SyncSummary,
+    ) -> bool {
+        match self.api.create_batch(batch) {
+            Ok(results) => {
+                if let Some(message) = validate_create_response(batch, &results) {
+                    return self.reconcile_create_batch(
+                        batch,
+                        &ApiWriteError {
+                            message,
+                            outcome_unknown: true,
+                            fatal: true,
+                        },
+                        existing,
+                        summary,
+                    );
+                }
+                for (word, api_word) in batch.iter().zip(results) {
+                    info!(
+                        external_id = %word.external_id,
+                        russian = %word.russian,
+                        api_word_id = %api_word.id,
+                        "Word created"
+                    );
+                    summary.created += 1;
+                    existing.insert(word.external_id.clone(), api_word);
+                }
+                false
+            }
+            Err(write_error) if write_error.outcome_unknown => {
+                self.reconcile_create_batch(batch, &write_error, existing, summary)
+            }
+            Err(write_error) => {
+                log_failed_words(batch, &write_error.message);
+                summary.failed += batch.len();
+                if write_error.fatal {
+                    summary.fatal_error = Some(write_error.message);
+                }
+                write_error.fatal
+            }
+        }
+    }
+
+    fn flush_updates(
+        &self,
+        batch: &[(ApiWord, ImportedWord)],
+        existing: &mut HashMap<String, ApiWord>,
+        summary: &mut SyncSummary,
+    ) -> bool {
+        match self.api.update_batch(batch) {
+            Ok(results) => {
+                if let Some(message) = validate_update_response(batch, &results) {
+                    return self.reconcile_update_batch(
+                        batch,
+                        &ApiWriteError {
+                            message,
+                            outcome_unknown: true,
+                            fatal: true,
+                        },
+                        existing,
+                        summary,
+                    );
+                }
+                for ((_, word), api_word) in batch.iter().zip(results) {
+                    info!(
+                        external_id = %word.external_id,
+                        russian = %word.russian,
+                        api_word_id = %api_word.id,
+                        "Word updated"
+                    );
+                    summary.updated += 1;
+                    existing.insert(word.external_id.clone(), api_word);
+                }
+                false
+            }
+            Err(write_error) if write_error.outcome_unknown => {
+                self.reconcile_update_batch(batch, &write_error, existing, summary)
+            }
+            Err(write_error) => {
+                log_failed_word_updates(batch, &write_error.message);
+                summary.failed += batch.len();
+                if write_error.fatal {
+                    summary.fatal_error = Some(write_error.message);
+                }
+                write_error.fatal
+            }
+        }
+    }
+
+    fn reconcile_create_batch(
+        &self,
+        batch: &[ImportedWord],
+        write_error: &ApiWriteError,
+        existing: &mut HashMap<String, ApiWord>,
+        summary: &mut SyncSummary,
+    ) -> bool {
+        let mut refreshed = match self.api.find_all_by_external_id() {
+            Ok(words) => words,
+            Err(error) => {
+                log_failed_words(batch, &write_error.message);
+                summary.failed += batch.len();
+                summary.fatal_error = Some(format!(
+                    "{}; could not reconcile word batch: {error:#}",
+                    write_error.message
+                ));
+                return true;
+            }
+        };
+
+        let mut unresolved = Vec::new();
+        for word in batch {
+            match refreshed.get(&word.external_id) {
+                Some(api_word) if api_word.checksum.as_deref() == Some(word.checksum.as_str()) => {
+                    info!(
+                        external_id = %word.external_id,
+                        russian = %word.russian,
+                        api_word_id = %api_word.id,
+                        "Word create outcome reconciled"
+                    );
+                    summary.created += 1;
+                }
+                Some(api_word) => unresolved.push(format!(
+                    "externalId={} has checksum {} instead of {}",
+                    word.external_id,
+                    api_word.checksum.as_deref().unwrap_or("<null>"),
+                    word.checksum
+                )),
+                None => unresolved.push(format!("externalId={} was not found", word.external_id)),
+            }
+        }
+
+        *existing = std::mem::take(&mut refreshed);
+        if unresolved.is_empty() {
+            false
+        } else {
+            for message in &unresolved {
+                error!(error = %message, "Word create outcome unresolved after reconciliation");
+            }
+            summary.failed += unresolved.len();
+            summary.fatal_error = Some(format!(
+                "{}; word batch reconciliation unresolved: {}",
+                write_error.message,
+                unresolved.join("; ")
+            ));
+            true
+        }
+    }
+
+    fn reconcile_update_batch(
+        &self,
+        batch: &[(ApiWord, ImportedWord)],
+        write_error: &ApiWriteError,
+        existing: &mut HashMap<String, ApiWord>,
+        summary: &mut SyncSummary,
+    ) -> bool {
+        let mut refreshed = match self.api.find_all_by_external_id() {
+            Ok(words) => words,
+            Err(error) => {
+                log_failed_word_updates(batch, &write_error.message);
+                summary.failed += batch.len();
+                summary.fatal_error = Some(format!(
+                    "{}; could not reconcile word batch: {error:#}",
+                    write_error.message
+                ));
+                return true;
+            }
+        };
+
+        let mut unresolved = Vec::new();
+        for (original, word) in batch {
+            match refreshed.get(&word.external_id) {
+                Some(api_word)
+                    if api_word.id == original.id
+                        && api_word.checksum.as_deref() == Some(word.checksum.as_str()) =>
+                {
+                    info!(
+                        external_id = %word.external_id,
+                        russian = %word.russian,
+                        api_word_id = %api_word.id,
+                        "Word update outcome reconciled"
+                    );
+                    summary.updated += 1;
+                }
+                Some(api_word) if api_word.id != original.id => unresolved.push(format!(
+                    "externalId={} changed API ID from {} to {}",
+                    word.external_id, original.id, api_word.id
+                )),
+                Some(api_word) => unresolved.push(format!(
+                    "externalId={} has checksum {} instead of {}",
+                    word.external_id,
+                    api_word.checksum.as_deref().unwrap_or("<null>"),
+                    word.checksum
+                )),
+                None => unresolved.push(format!("externalId={} was not found", word.external_id)),
+            }
+        }
+
+        *existing = std::mem::take(&mut refreshed);
+        if unresolved.is_empty() {
+            false
+        } else {
+            for message in &unresolved {
+                error!(error = %message, "Word update outcome unresolved after reconciliation");
+            }
+            summary.failed += unresolved.len();
+            summary.fatal_error = Some(format!(
+                "{}; word batch reconciliation unresolved: {}",
+                write_error.message,
+                unresolved.join("; ")
+            ));
+            true
+        }
+    }
+}
+
+fn validate_create_response(batch: &[ImportedWord], results: &[ApiWord]) -> Option<String> {
+    if batch.len() != results.len() {
+        return Some(format!(
+            "API returned {} words for create batch of {}",
+            results.len(),
+            batch.len()
+        ));
+    }
+    for (word, api_word) in batch.iter().zip(results) {
+        if api_word.external_id != word.external_id {
+            return Some(format!(
+                "API returned externalId={} for requested externalId={}",
+                api_word.external_id, word.external_id
+            ));
+        }
+        if api_word.checksum.as_deref() != Some(word.checksum.as_str()) {
+            return Some(format!(
+                "API checksum mismatch for externalId={}: expected {}, received {}",
+                word.external_id,
+                word.checksum,
+                api_word.checksum.as_deref().unwrap_or("<null>")
+            ));
+        }
+    }
+    None
+}
+
+fn validate_update_response(
+    batch: &[(ApiWord, ImportedWord)],
+    results: &[ApiWord],
+) -> Option<String> {
+    if batch.len() != results.len() {
+        return Some(format!(
+            "API returned {} words for update batch of {}",
+            results.len(),
+            batch.len()
+        ));
+    }
+    for ((original, word), api_word) in batch.iter().zip(results) {
+        if api_word.external_id != word.external_id {
+            return Some(format!(
+                "API returned externalId={} for requested externalId={}",
+                api_word.external_id, word.external_id
+            ));
+        }
+        if api_word.id != original.id {
+            return Some(format!(
+                "API changed ID for externalId={}: expected {}, received {}",
+                word.external_id, original.id, api_word.id
+            ));
+        }
+        if api_word.checksum.as_deref() != Some(word.checksum.as_str()) {
+            return Some(format!(
+                "API checksum mismatch for externalId={}: expected {}, received {}",
+                word.external_id,
+                word.checksum,
+                api_word.checksum.as_deref().unwrap_or("<null>")
+            ));
+        }
+    }
+    None
+}
+
+fn log_failed_words(batch: &[ImportedWord], message: &str) {
+    for word in batch {
+        error!(
+            external_id = %word.external_id,
+            russian = %word.russian,
+            error = %message,
+            "Word synchronization failed"
+        );
+    }
+}
+
+fn log_failed_word_updates(batch: &[(ApiWord, ImportedWord)], message: &str) {
+    for (_, word) in batch {
+        error!(
+            external_id = %word.external_id,
+            russian = %word.russian,
+            error = %message,
+            "Word synchronization failed"
+        );
     }
 }
 

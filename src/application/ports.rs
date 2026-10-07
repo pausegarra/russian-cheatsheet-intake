@@ -59,27 +59,11 @@ pub struct ApiWord {
     pub checksum: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum WriteEffect {
-    Created,
-    Updated,
-}
-
-pub struct WriteResult {
-    pub word: ApiWord,
-    pub effect: WriteEffect,
-}
-
 #[derive(Clone, Debug)]
 pub struct ApiExample {
     pub id: String,
     pub external_id: String,
     pub checksum: Option<String>,
-}
-
-pub struct ExampleWriteResult {
-    pub example: ApiExample,
-    pub effect: WriteEffect,
 }
 
 #[derive(Debug)]
@@ -117,14 +101,6 @@ pub trait WordsApi {
         &self,
         updates: &[(ApiWord, ImportedWord)],
     ) -> std::result::Result<Vec<ApiWord>, ApiWriteError>;
-
-    fn create(&self, word: &ImportedWord) -> std::result::Result<WriteResult, ApiWriteError>;
-
-    fn update(
-        &self,
-        existing: &ApiWord,
-        word: &ImportedWord,
-    ) -> std::result::Result<WriteResult, ApiWriteError>;
 }
 
 pub trait ExamplesApi {
@@ -139,15 +115,4 @@ pub trait ExamplesApi {
         &self,
         updates: &[(ApiExample, ImportedExample)],
     ) -> std::result::Result<Vec<ApiExample>, ApiWriteError>;
-
-    fn create_example(
-        &self,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError>;
-
-    fn update_example(
-        &self,
-        existing: &ApiExample,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError>;
 }

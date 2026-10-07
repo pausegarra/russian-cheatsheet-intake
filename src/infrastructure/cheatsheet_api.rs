@@ -1,7 +1,4 @@
-use crate::application::ports::{
-    ApiExample, ApiWord, ApiWriteError, ExampleWriteResult, ExamplesApi, WordsApi, WriteEffect,
-    WriteResult,
-};
+use crate::application::ports::{ApiExample, ApiWord, ApiWriteError, ExamplesApi, WordsApi};
 use crate::domain::example::ImportedExample;
 use crate::domain::word::ImportedWord;
 use crate::infrastructure::keycloak::JwtKeycloakContextHolder;
@@ -270,134 +267,6 @@ impl CheatsheetApi {
         })
     }
 
-    fn send_word(
-        &self,
-        method: Method,
-        url: Url,
-        word: &ImportedWord,
-    ) -> std::result::Result<ApiWord, ApiWriteError> {
-        let request = word.request();
-        let token = self.keycloak.get_token().map_err(api_error)?;
-        let response = self
-            .http
-            .request(method, url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .map_err(|error| ApiWriteError {
-                message: format!("request failed: {error}"),
-                outcome_unknown: error.is_timeout() || error.is_connect(),
-                fatal: false,
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|error| format!("<could not read body: {error}>"));
-            return Err(ApiWriteError {
-                message: format!("API returned {status}: {body}"),
-                outcome_unknown: status == StatusCode::CONFLICT || status.is_server_error(),
-                fatal: status == StatusCode::UNAUTHORIZED
-                    || status == StatusCode::FORBIDDEN
-                    || status.is_server_error(),
-            });
-        }
-
-        let item: WordResponse = response.json().map_err(|error| ApiWriteError {
-            message: format!("API returned an unreadable word response: {error}"),
-            outcome_unknown: true,
-            fatal: false,
-        })?;
-        Ok(ApiWord {
-            id: item.id,
-            external_id: item.external_id.unwrap_or_default(),
-            checksum: item.checksum,
-        })
-    }
-
-    fn send_example(
-        &self,
-        method: Method,
-        url: Url,
-        example: &ImportedExample,
-        include_external_id: bool,
-    ) -> std::result::Result<ApiExample, ApiWriteError> {
-        let request = example.request(include_external_id);
-        let mut rate_limit_retries = 0;
-        let response = loop {
-            let token = self.keycloak.get_token().map_err(api_error)?;
-            let response = self
-                .http
-                .request(method.clone(), url.clone())
-                .bearer_auth(token)
-                .json(&request)
-                .send()
-                .map_err(|error| ApiWriteError {
-                    message: format!("request failed: {error}"),
-                    outcome_unknown: error.is_timeout() || error.is_connect(),
-                    fatal: false,
-                })?;
-
-            if response.status() != StatusCode::TOO_MANY_REQUESTS
-                || rate_limit_retries >= MAX_RATE_LIMIT_RETRIES
-            {
-                break response;
-            }
-
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|header| header.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok());
-            let fallback_delay =
-                Duration::from_secs(1u64 << rate_limit_retries).min(MAX_RATE_LIMIT_DELAY);
-            let delay = retry_after
-                .map(Duration::from_secs)
-                .unwrap_or(fallback_delay);
-            warn!(
-                external_id = %example.external_id,
-                retry = rate_limit_retries + 1,
-                delay_seconds = delay.as_secs(),
-                "Example write was rate limited; retrying"
-            );
-            std::thread::sleep(delay);
-            rate_limit_retries += 1;
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|error| format!("<could not read body: {error}>"));
-            return Err(ApiWriteError {
-                message: format!("API returned {status}: {body}"),
-                outcome_unknown: status == StatusCode::CONFLICT || status.is_server_error(),
-                fatal: status == StatusCode::UNAUTHORIZED
-                    || status == StatusCode::FORBIDDEN
-                    || status.is_server_error(),
-            });
-        }
-
-        let item: ExampleResponse = response.json().map_err(|error| ApiWriteError {
-            message: format!("API returned an unreadable example response: {error}"),
-            outcome_unknown: true,
-            fatal: false,
-        })?;
-        let Some(external_id) = item.external_id else {
-            return Err(ApiWriteError {
-                message: "API returned an example without externalId".to_owned(),
-                outcome_unknown: true,
-                fatal: true,
-            });
-        };
-        Ok(ApiExample {
-            id: item.id,
-            external_id,
-            checksum: item.checksum,
-        })
-    }
-
     fn checked_result(
         &self,
         api_word: ApiWord,
@@ -473,42 +342,6 @@ impl CheatsheetApi {
         }
         Ok(api_example)
     }
-
-    fn reconcile(
-        &self,
-        word: &ImportedWord,
-    ) -> std::result::Result<Option<ApiWord>, ApiWriteError> {
-        self.find_all()
-            .map(|mut words| words.remove(&word.external_id))
-            .map_err(|error| ApiWriteError {
-                message: format!(
-                    "could not reconcile externalId={}: {error:#}",
-                    word.external_id
-                ),
-                outcome_unknown: true,
-                fatal: true,
-            })
-    }
-
-    fn word_url(&self, id: Option<&str>) -> Result<Url> {
-        let mut url = self.base_url.join("words")?;
-        if let Some(id) = id {
-            url.path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("API URL cannot accept word ID"))?
-                .push(id);
-        }
-        Ok(url)
-    }
-
-    fn example_url(&self, id: Option<&str>) -> Result<Url> {
-        let mut url = self.base_url.join("examples")?;
-        if let Some(id) = id {
-            url.path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("API URL cannot accept example ID"))?
-                .push(id);
-        }
-        Ok(url)
-    }
 }
 
 impl WordsApi for CheatsheetApi {
@@ -532,7 +365,7 @@ impl WordsApi for CheatsheetApi {
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "words",
-            false,
+            true,
         )?;
         let items: Vec<WordResponse> = response.json().map_err(|error| ApiWriteError {
             message: format!("API returned an unreadable words batch response: {error}"),
@@ -578,7 +411,7 @@ impl WordsApi for CheatsheetApi {
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "words",
-            false,
+            true,
         )?;
         let items: Vec<WordResponse> = response.json().map_err(|error| ApiWriteError {
             message: format!("API returned an unreadable words batch response: {error}"),
@@ -603,81 +436,6 @@ impl WordsApi for CheatsheetApi {
                 .map_err(mark_batch_integrity_error)
             })
             .collect()
-    }
-
-    fn create(&self, word: &ImportedWord) -> std::result::Result<WriteResult, ApiWriteError> {
-        match self.send_word(Method::POST, self.word_url(None).map_err(api_error)?, word) {
-            Ok(api_word) => {
-                let api_word = self.checked_result(api_word, word, None)?;
-                Ok(WriteResult {
-                    word: api_word,
-                    effect: WriteEffect::Created,
-                })
-            }
-            Err(error) if error.outcome_unknown => {
-                warn!(
-                    external_id = %word.external_id,
-                    "Create outcome is unknown; reconciling against API"
-                );
-                let Some(existing) = self.reconcile(word)? else {
-                    return Err(ApiWriteError {
-                        message: format!(
-                            "{}; externalId={} not found after reconciliation",
-                            error.message, word.external_id
-                        ),
-                        outcome_unknown: true,
-                        fatal: true,
-                    });
-                };
-                if existing.checksum.as_deref() == Some(word.checksum.as_str()) {
-                    return Ok(WriteResult {
-                        word: existing,
-                        effect: WriteEffect::Created,
-                    });
-                }
-                self.update(&existing, word)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn update(
-        &self,
-        existing: &ApiWord,
-        word: &ImportedWord,
-    ) -> std::result::Result<WriteResult, ApiWriteError> {
-        let url = self.word_url(Some(&existing.id)).map_err(api_error)?;
-        match self.send_word(Method::PUT, url, word) {
-            Ok(api_word) => {
-                let api_word = self.checked_result(api_word, word, Some(&existing.id))?;
-                Ok(WriteResult {
-                    word: api_word,
-                    effect: WriteEffect::Updated,
-                })
-            }
-            Err(error) if error.outcome_unknown => {
-                warn!(
-                    external_id = %word.external_id,
-                    "Update outcome is unknown; reconciling against API"
-                );
-                let Some(current) = self.reconcile(word)? else {
-                    return Err(ApiWriteError {
-                        message: format!(
-                            "{}; externalId={} not found after reconciliation",
-                            error.message, word.external_id
-                        ),
-                        outcome_unknown: true,
-                        fatal: true,
-                    });
-                };
-                let current = self.checked_result(current, word, Some(&existing.id))?;
-                Ok(WriteResult {
-                    word: current,
-                    effect: WriteEffect::Updated,
-                })
-            }
-            Err(error) => Err(error),
-        }
     }
 }
 
@@ -790,46 +548,6 @@ impl ExamplesApi for CheatsheetApi {
                 .map_err(mark_batch_integrity_error)
             })
             .collect()
-    }
-
-    fn create_example(
-        &self,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
-        match self.send_example(
-            Method::POST,
-            self.example_url(None).map_err(api_error)?,
-            example,
-            true,
-        ) {
-            Ok(api_example) => {
-                let api_example = self.checked_example_result(api_example, example, None)?;
-                Ok(ExampleWriteResult {
-                    example: api_example,
-                    effect: WriteEffect::Created,
-                })
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn update_example(
-        &self,
-        existing: &ApiExample,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
-        let url = self.example_url(Some(&existing.id)).map_err(api_error)?;
-        match self.send_example(Method::PUT, url, example, false) {
-            Ok(api_example) => {
-                let api_example =
-                    self.checked_example_result(api_example, example, Some(&existing.id))?;
-                Ok(ExampleWriteResult {
-                    example: api_example,
-                    effect: WriteEffect::Updated,
-                })
-            }
-            Err(error) => Err(error),
-        }
     }
 }
 

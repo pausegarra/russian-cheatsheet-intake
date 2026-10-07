@@ -16,7 +16,9 @@ cp .env.example .env
 cargo run --release
 ```
 
-Logs include UTC timestamps, source CSV export events, API page progress, word sync outcomes, and INFO events for each example create, update, checksum match, and disabled/unlinked skip; final counts follow. Intake sends one POST or PUT per changed example; the initial full import may take time. HTTP 429 responses honor numeric `Retry-After` values or use capped backoff, up to four retries per request. Intake downloads and parses each full CSV in memory without row chunks. Set `RUST_LOG=debug` before `cargo run --release` to see request starts and cached-token reuse.
+`RUSSIAN_CHEATSHEET_BATCH_SIZE` sets the positive maximum size of each write batch; default is `1000`. Intake uses four independent buffers: word creates, word updates, example creates, and example updates. It flushes a buffer at the threshold and sends each nonempty remainder after its source pass. Writes use `POST` and `PUT /api/words/batch` and `POST` and `PUT /api/examples/batch`; all word batches finish before example batches so examples use the returned word UUIDs. Keep the intake batch size at or below the API's `app.batch.max-size`.
+
+Logs include UTC timestamps, source CSV export events, API page progress, word and example batch outcomes, checksum matches, disabled/unlinked skips, and final counts. HTTP 429 retries resend the whole batch request, honoring numeric `Retry-After` values or using capped backoff, up to four retries per request. Intake downloads and parses each full CSV in memory; it also prepares source words in memory and does not chunk source iteration. Set `RUST_LOG=debug` before `cargo run --release` to see request starts and cached-token reuse.
 
 Set `KEYCLOAK_TOKEN_URL` to the full OpenID Connect token endpoint URL, usually `https://<host>/realms/<realm>/protocol/openid-connect/token`. Intake uses the `client_credentials` grant. `JwtKeycloakContextHolder.get_token()` checks expiry on every request and renews the token 30 seconds early, using the earlier of JWT `exp` and Keycloak `expires_in`.
 

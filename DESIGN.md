@@ -13,7 +13,8 @@ Create a Rust CLI that synchronizes active OpenRussian words and linked example 
 - Store `sentences.id` as the API example `externalId`; use the API example UUID to update an existing sentence when its checksum changes.
 - Read public OpenRussian data through TogetherDB; no PostgreSQL/MySQL DSN required.
 - Create missing API words and update existing imported words when the API's global word checksum differs.
-- Create missing API examples, skip unchanged examples, and update changed examples by API UUID. Do not add a batch endpoint.
+- Create missing API examples, skip unchanged examples, and update changed examples by API UUID through the API batch routes.
+- Buffer changed word and example writes by operation, with request size controlled by `RUSSIAN_CHEATSHEET_BATCH_SIZE`.
 - Skip disabled OpenRussian rows. Never delete API words.
 - Never delete API examples when an OpenRussian sentence is disabled or removed; the API has no example deletion endpoint.
 - Do not generate Spanish translations in this version.
@@ -22,7 +23,7 @@ Create a Rust CLI that synchronizes active OpenRussian words and linked example 
 
 ## Source access and mapping
 
-The source adapter resolves the worker from the public connection ID in the supplied TogetherDB URL, requests one complete CSV export per source table, downloads each export by its export key, and parses the entire file in memory. No row paging or chunks. The export endpoints serve TogetherDB's web client and are not documented as a stable third-party API.
+The source adapter resolves the worker from the public connection ID in the supplied TogetherDB URL, requests one complete CSV export per source table, downloads each export by its export key, and parses the entire file in memory. Intake also prepares source words and examples in memory; source iteration is not chunked. Only API writes are buffered into requests. The export endpoints serve TogetherDB's web client and are not documented as a stable third-party API.
 
 Read these tables:
 
@@ -46,18 +47,17 @@ Preserve sentence Russian and translation text exactly. The source does not incl
 
 Fetch every page from `GET /api/words` and build an in-memory map keyed by `externalId`, storing API `id` and `checksum`. `externalId` is the OpenRussian `words.id` and is the identity key; Russian text and checksum are not identity keys. This handles homographs and identical payloads with distinct OpenRussian IDs.
 
-For each active source word:
+For each active source word, compare its checksum during the single pass and skip matches. Changed words enter one of two independent buffers: creates or updates. Send them through `POST /api/words/batch` and `PUT /api/words/batch`, respectively. After each successful response, validate items in request order and update the in-memory map keyed by `externalId`; updates keep the original API ID. Flush a buffer when it reaches the configured threshold, then flush each nonempty remainder after the pass.
 
-1. Normalize the API payload and compute its expected checksum.
-2. If no API row has that `externalId`, call `POST /api/words`, regardless of checksum. Add the returned `id` and checksum to the in-memory map.
-3. If an API row exists and its checksum equals the expected checksum, skip the write.
-4. If an API row exists and its checksum is null or differs, call `PUT /api/words/{id}` with the same `externalId`.
+Examples use the same pattern with separate create and update buffers and `POST /api/examples/batch` / `PUT /api/examples/batch`. Run all word batches before examples so every example links through the updated word map. The four buffers are independent; an item enters only its create or update buffer.
 
-Omit the checksum from requests; the API computes and returns it. On an ambiguous POST timeout, re-read API pages and reconcile by `externalId` before retrying. The API has a unique index on non-null `externalId`, so blind POST retries can conflict. A process restart needs no local recovery file: the next run discovers completed creates from the API.
+`RUSSIAN_CHEATSHEET_BATCH_SIZE` must be a positive integer and defaults to `1000`. Keep it at or below the API's `app.batch.max-size`; every write request must satisfy that server limit. HTTP 429 retries resend a whole batch request, honoring numeric `Retry-After` values or using capped backoff, up to four retries per request. Do not retry individual records through single-record endpoints. For an outcome-unknown batch, reload API IDs and checksums, then reconcile by `externalId` and expected checksum; updates must still have their original API ID. Count unresolved entries as failed and stop when reconciliation cannot establish their outcomes.
+
+For each active source word, normalize the API payload and compute its expected checksum. Queue it for create if no API row has its `externalId`; skip it if the checksum matches; otherwise queue it for update with the existing API ID. Omit the checksum from requests; the API computes and returns it. Batch responses are in request order, and each returned ID/checksum is validated before updating the in-memory map. On an ambiguous batch outcome, reload API pages and reconcile each queued word by `externalId` and expected checksum. Updates must retain their original API ID. Do not retry an uncertain create blindly: the API has a unique index on non-null `externalId`. A process restart needs no local recovery file; the next run discovers completed creates from the API.
 
 Use a confidential Keycloak client with the `client_credentials` grant for the API's `words#create` and `words#update` roles. Keep `KEYCLOAK_TOKEN_URL`, `KEYCLOAK_CLIENT_ID`, and `KEYCLOAK_CLIENT_SECRET` in environment configuration; do not place credentials or access tokens in the repository. The `JwtKeycloakContextHolder` checks cached JWT `exp` on every token request and obtains a new token 30 seconds before expiry.
 
-The same service account also needs `examples#create` and `examples#update`. Read every page from `GET /api/examples?externalIdOnly=true`, which populates only `id`, non-null `externalId`, and `checksum`; other DTO fields are null, and linked words/translations are not loaded. For each active linked sentence, POST when its source ID is absent, skip when checksum matches, and PUT `/api/examples/{id}` when checksum differs. Update requests omit `externalId`; the API preserves it. On an ambiguous write, re-read the projected listing and reconcile by source ID before any further write. Each changed sentence uses an individual write request. HTTP 429 responses honor numeric `Retry-After` values or use capped backoff, up to four retries.
+The same service account also needs `examples#create` and `examples#update`. Read every page from `GET /api/examples?externalIdOnly=true`, which populates only `id`, non-null `externalId`, and `checksum`; other DTO fields are null, and linked words/translations are not loaded. For each active linked sentence, skip when checksum matches. Add missing sentences to the create buffer and changed sentences to the update buffer, keeping update requests keyed by the existing API UUID. Update requests omit `externalId`; the API preserves it. After a successful batch response, validate each result and update the example map. For an ambiguous batch write, re-read the projected listing and reconcile each entry by source ID, expected checksum, and original UUID for updates. Do not fall back to individual writes.
 
 ## Checksum contract
 

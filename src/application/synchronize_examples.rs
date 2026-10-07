@@ -1,11 +1,10 @@
 use crate::application::ports::{
-    ApiExample, ApiWord, ApiWriteError, ExampleWriteResult, ExamplesApi, SourceExampleSnapshot,
-    WriteEffect,
+    ApiExample, ApiWord, ApiWriteError, ExamplesApi, SourceExampleSnapshot,
 };
 use crate::domain::example::{ExampleTranslation, ImportedExample};
 use anyhow::Result;
 use std::collections::HashMap;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Default)]
 pub struct ExampleSyncSummary {
@@ -21,11 +20,12 @@ pub struct ExampleSyncSummary {
 
 pub struct SynchronizeExamples<A> {
     api: A,
+    batch_size: usize,
 }
 
 impl<A: ExamplesApi> SynchronizeExamples<A> {
-    pub fn new(api: A) -> Self {
-        Self { api }
+    pub fn new(api: A, batch_size: usize) -> Self {
+        Self { api, batch_size }
     }
 
     pub fn run(
@@ -52,6 +52,10 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
             api_examples = existing.len(),
             "Russian Cheatsheet examples loaded"
         );
+
+        let mut creates = Vec::new();
+        let mut updates = Vec::new();
+        let mut stop = false;
 
         for source_example in examples {
             if source_example.disabled {
@@ -136,48 +140,43 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
                 }
             }
 
-            let write = match existing.get(&example.external_id) {
-                Some(api_example) => self.update_with_reconciliation(api_example, &example),
-                None => self.create_with_reconciliation(&example),
-            };
+            match existing.get(&example.external_id) {
+                Some(api_example) => updates.push((api_example.clone(), example)),
+                None => creates.push(example),
+            }
 
-            match write {
-                Ok(result) => {
-                    match result.effect {
-                        WriteEffect::Created => {
-                            summary.created += 1;
-                            info!(
-                                external_id = %example.external_id,
-                                russian = %example.russian,
-                                api_example_id = %result.example.id,
-                                "Example created"
-                            );
-                        }
-                        WriteEffect::Updated => {
-                            summary.updated += 1;
-                            info!(
-                                external_id = %example.external_id,
-                                russian = %example.russian,
-                                api_example_id = %result.example.id,
-                                "Example updated"
-                            );
-                        }
-                    }
-                    existing.insert(example.external_id.clone(), result.example);
+            if creates.len() >= self.batch_size {
+                let batch = std::mem::take(&mut creates);
+                if self.flush_creates(&batch, &mut existing, &mut summary) {
+                    summary.failed += updates.len();
+                    updates.clear();
+                    stop = true;
+                    break;
                 }
-                Err(write_error) => {
-                    error!(
-                        external_id = %example.external_id,
-                        russian = %example.russian,
-                        error = %write_error.message,
-                        "Example synchronization failed"
-                    );
-                    summary.failed += 1;
-                    if write_error.fatal {
-                        summary.fatal_error = Some(write_error.message);
-                        break;
-                    }
+            }
+            if updates.len() >= self.batch_size {
+                let batch = std::mem::take(&mut updates);
+                if self.flush_updates(&batch, &mut existing, &mut summary) {
+                    summary.failed += creates.len();
+                    creates.clear();
+                    stop = true;
+                    break;
                 }
+            }
+        }
+
+        if !stop {
+            let batch = std::mem::take(&mut creates);
+            if !batch.is_empty() && self.flush_creates(&batch, &mut existing, &mut summary) {
+                summary.failed += updates.len();
+                updates.clear();
+                stop = true;
+            }
+        }
+        if !stop {
+            let batch = std::mem::take(&mut updates);
+            if !batch.is_empty() {
+                self.flush_updates(&batch, &mut existing, &mut summary);
             }
         }
 
@@ -194,129 +193,311 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
         Ok(summary)
     }
 
-    fn create_with_reconciliation(
+    fn flush_creates(
         &self,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
-        match self.api.create_example(example) {
-            Ok(result) => Ok(result),
-            Err(error) if error.outcome_unknown => {
-                warn!(
-                    external_id = %example.external_id,
-                    "Create outcome is unknown; reconciling by externalId"
-                );
-                let Some(existing) = self.reconcile(example)? else {
-                    return Err(fatal_write_error(format!(
-                        "{}; externalId={} not found after reconciliation",
-                        error.message, example.external_id
-                    )));
-                };
-                if existing.checksum.as_deref() == Some(example.checksum.as_str()) {
-                    return Ok(ExampleWriteResult {
-                        example: existing,
-                        effect: WriteEffect::Created,
-                    });
+        batch: &[ImportedExample],
+        existing: &mut HashMap<String, ApiExample>,
+        summary: &mut ExampleSyncSummary,
+    ) -> bool {
+        match self.api.create_examples_batch(batch) {
+            Ok(results) => {
+                if let Some(message) = validate_create_response(batch, &results) {
+                    return self.reconcile_create_batch(
+                        batch,
+                        &ApiWriteError {
+                            message,
+                            outcome_unknown: true,
+                            fatal: true,
+                        },
+                        existing,
+                        summary,
+                    );
                 }
-                self.update_with_reconciliation(&existing, example)
+                for (example, api_example) in batch.iter().zip(results) {
+                    info!(
+                        external_id = %example.external_id,
+                        russian = %example.russian,
+                        api_example_id = %api_example.id,
+                        "Example created"
+                    );
+                    summary.created += 1;
+                    existing.insert(example.external_id.clone(), api_example);
+                }
+                false
             }
-            Err(error) => Err(error),
+            Err(write_error) if write_error.outcome_unknown => {
+                self.reconcile_create_batch(batch, &write_error, existing, summary)
+            }
+            Err(write_error) => {
+                log_failed_examples(batch, &write_error.message);
+                summary.failed += batch.len();
+                if write_error.fatal {
+                    summary.fatal_error = Some(write_error.message);
+                }
+                write_error.fatal
+            }
         }
     }
 
-    fn update_with_reconciliation(
+    fn flush_updates(
         &self,
-        existing: &ApiExample,
-        example: &ImportedExample,
-    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
-        match self.api.update_example(existing, example) {
-            Ok(result) => Ok(result),
-            Err(error) if error.outcome_unknown => {
-                warn!(
-                    external_id = %example.external_id,
-                    api_example_id = %existing.id,
-                    "Update outcome is unknown; reconciling by externalId"
-                );
-                let Some(current) = self.reconcile(example)? else {
-                    return Err(fatal_write_error(format!(
-                        "{}; externalId={} not found after reconciliation",
-                        error.message, example.external_id
-                    )));
-                };
-                if current.id == existing.id
-                    && current.checksum.as_deref() == Some(example.checksum.as_str())
+        batch: &[(ApiExample, ImportedExample)],
+        existing: &mut HashMap<String, ApiExample>,
+        summary: &mut ExampleSyncSummary,
+    ) -> bool {
+        match self.api.update_examples_batch(batch) {
+            Ok(results) => {
+                if let Some(message) = validate_update_response(batch, &results) {
+                    return self.reconcile_update_batch(
+                        batch,
+                        &ApiWriteError {
+                            message,
+                            outcome_unknown: true,
+                            fatal: true,
+                        },
+                        existing,
+                        summary,
+                    );
+                }
+                for ((_, example), api_example) in batch.iter().zip(results) {
+                    info!(
+                        external_id = %example.external_id,
+                        russian = %example.russian,
+                        api_example_id = %api_example.id,
+                        "Example updated"
+                    );
+                    summary.updated += 1;
+                    existing.insert(example.external_id.clone(), api_example);
+                }
+                false
+            }
+            Err(write_error) if write_error.outcome_unknown => {
+                self.reconcile_update_batch(batch, &write_error, existing, summary)
+            }
+            Err(write_error) => {
+                log_failed_example_updates(batch, &write_error.message);
+                summary.failed += batch.len();
+                if write_error.fatal {
+                    summary.fatal_error = Some(write_error.message);
+                }
+                write_error.fatal
+            }
+        }
+    }
+
+    fn reconcile_create_batch(
+        &self,
+        batch: &[ImportedExample],
+        write_error: &ApiWriteError,
+        existing: &mut HashMap<String, ApiExample>,
+        summary: &mut ExampleSyncSummary,
+    ) -> bool {
+        let mut refreshed = match self.api.find_all_examples_by_external_id() {
+            Ok(examples) => examples,
+            Err(error) => {
+                log_failed_examples(batch, &write_error.message);
+                summary.failed += batch.len();
+                summary.fatal_error = Some(format!(
+                    "{}; could not reconcile example batch: {error:#}",
+                    write_error.message
+                ));
+                return true;
+            }
+        };
+
+        let mut unresolved = Vec::new();
+        for example in batch {
+            match refreshed.get(&example.external_id) {
+                Some(api_example)
+                    if api_example.checksum.as_deref() == Some(example.checksum.as_str()) =>
                 {
-                    return Ok(ExampleWriteResult {
-                        example: current,
-                        effect: WriteEffect::Updated,
-                    });
+                    info!(
+                        external_id = %example.external_id,
+                        russian = %example.russian,
+                        api_example_id = %api_example.id,
+                        "Example create outcome reconciled"
+                    );
+                    summary.created += 1;
                 }
-                if current.id != existing.id {
-                    return Err(fatal_write_error(format!(
-                        "{}; externalId={} changed API UUID from {} to {}",
-                        error.message, example.external_id, existing.id, current.id
-                    )));
-                }
-
-                warn!(
-                    external_id = %example.external_id,
-                    api_example_id = %current.id,
-                    "Update checksum is still stale after reconciliation; retrying PUT once"
-                );
-                match self.api.update_example(&current, example) {
-                    Ok(result) => Ok(result),
-                    Err(retry_error) if retry_error.outcome_unknown => {
-                        let Some(retried_current) = self.reconcile(example)? else {
-                            return Err(fatal_write_error(format!(
-                                "{}; retry failed: {}; externalId={} not found after reconciliation",
-                                error.message, retry_error.message, example.external_id
-                            )));
-                        };
-                        if retried_current.id == existing.id
-                            && retried_current.checksum.as_deref()
-                                == Some(example.checksum.as_str())
-                        {
-                            Ok(ExampleWriteResult {
-                                example: retried_current,
-                                effect: WriteEffect::Updated,
-                            })
-                        } else {
-                            Err(fatal_write_error(format!(
-                                "{}; retry failed: {}; externalId={} remains at API UUID {} with checksum {}",
-                                error.message,
-                                retry_error.message,
-                                example.external_id,
-                                retried_current.id,
-                                retried_current.checksum.as_deref().unwrap_or("<null>")
-                            )))
-                        }
-                    }
-                    Err(retry_error) => Err(retry_error),
+                Some(api_example) => unresolved.push(format!(
+                    "externalId={} has checksum {} instead of {}",
+                    example.external_id,
+                    api_example.checksum.as_deref().unwrap_or("<null>"),
+                    example.checksum
+                )),
+                None => {
+                    unresolved.push(format!("externalId={} was not found", example.external_id))
                 }
             }
-            Err(error) => Err(error),
+        }
+
+        *existing = std::mem::take(&mut refreshed);
+        if unresolved.is_empty() {
+            false
+        } else {
+            for message in &unresolved {
+                error!(error = %message, "Example create outcome unresolved after reconciliation");
+            }
+            summary.failed += unresolved.len();
+            summary.fatal_error = Some(format!(
+                "{}; example batch reconciliation unresolved: {}",
+                write_error.message,
+                unresolved.join("; ")
+            ));
+            true
         }
     }
 
-    fn reconcile(
+    fn reconcile_update_batch(
         &self,
-        example: &ImportedExample,
-    ) -> std::result::Result<Option<ApiExample>, ApiWriteError> {
-        self.api
-            .find_all_examples_by_external_id()
-            .map(|mut examples| examples.remove(&example.external_id))
-            .map_err(|error| {
-                fatal_write_error(format!(
-                    "could not reconcile externalId={}: {error:#}",
-                    example.external_id
-                ))
-            })
+        batch: &[(ApiExample, ImportedExample)],
+        write_error: &ApiWriteError,
+        existing: &mut HashMap<String, ApiExample>,
+        summary: &mut ExampleSyncSummary,
+    ) -> bool {
+        let mut refreshed = match self.api.find_all_examples_by_external_id() {
+            Ok(examples) => examples,
+            Err(error) => {
+                log_failed_example_updates(batch, &write_error.message);
+                summary.failed += batch.len();
+                summary.fatal_error = Some(format!(
+                    "{}; could not reconcile example batch: {error:#}",
+                    write_error.message
+                ));
+                return true;
+            }
+        };
+
+        let mut unresolved = Vec::new();
+        for (original, example) in batch {
+            match refreshed.get(&example.external_id) {
+                Some(api_example)
+                    if api_example.id == original.id
+                        && api_example.checksum.as_deref() == Some(example.checksum.as_str()) =>
+                {
+                    info!(
+                        external_id = %example.external_id,
+                        russian = %example.russian,
+                        api_example_id = %api_example.id,
+                        "Example update outcome reconciled"
+                    );
+                    summary.updated += 1;
+                }
+                Some(api_example) if api_example.id != original.id => unresolved.push(format!(
+                    "externalId={} changed API UUID from {} to {}",
+                    example.external_id, original.id, api_example.id
+                )),
+                Some(api_example) => unresolved.push(format!(
+                    "externalId={} has checksum {} instead of {}",
+                    example.external_id,
+                    api_example.checksum.as_deref().unwrap_or("<null>"),
+                    example.checksum
+                )),
+                None => {
+                    unresolved.push(format!("externalId={} was not found", example.external_id))
+                }
+            }
+        }
+
+        *existing = std::mem::take(&mut refreshed);
+        if unresolved.is_empty() {
+            false
+        } else {
+            for message in &unresolved {
+                error!(error = %message, "Example update outcome unresolved after reconciliation");
+            }
+            summary.failed += unresolved.len();
+            summary.fatal_error = Some(format!(
+                "{}; example batch reconciliation unresolved: {}",
+                write_error.message,
+                unresolved.join("; ")
+            ));
+            true
+        }
     }
 }
 
-fn fatal_write_error(message: String) -> ApiWriteError {
-    ApiWriteError {
-        message,
-        outcome_unknown: true,
-        fatal: true,
+fn validate_create_response(batch: &[ImportedExample], results: &[ApiExample]) -> Option<String> {
+    if batch.len() != results.len() {
+        return Some(format!(
+            "API returned {} examples for create batch of {}",
+            results.len(),
+            batch.len()
+        ));
+    }
+    for (example, api_example) in batch.iter().zip(results) {
+        if api_example.external_id != example.external_id {
+            return Some(format!(
+                "API returned externalId={} for requested externalId={}",
+                api_example.external_id, example.external_id
+            ));
+        }
+        if api_example.checksum.as_deref() != Some(example.checksum.as_str()) {
+            return Some(format!(
+                "API checksum mismatch for example externalId={}: expected {}, received {}",
+                example.external_id,
+                example.checksum,
+                api_example.checksum.as_deref().unwrap_or("<null>")
+            ));
+        }
+    }
+    None
+}
+
+fn validate_update_response(
+    batch: &[(ApiExample, ImportedExample)],
+    results: &[ApiExample],
+) -> Option<String> {
+    if batch.len() != results.len() {
+        return Some(format!(
+            "API returned {} examples for update batch of {}",
+            results.len(),
+            batch.len()
+        ));
+    }
+    for ((original, example), api_example) in batch.iter().zip(results) {
+        if api_example.external_id != example.external_id {
+            return Some(format!(
+                "API returned externalId={} for requested externalId={}",
+                api_example.external_id, example.external_id
+            ));
+        }
+        if api_example.id != original.id {
+            return Some(format!(
+                "API changed UUID for example externalId={}: expected {}, received {}",
+                example.external_id, original.id, api_example.id
+            ));
+        }
+        if api_example.checksum.as_deref() != Some(example.checksum.as_str()) {
+            return Some(format!(
+                "API checksum mismatch for example externalId={}: expected {}, received {}",
+                example.external_id,
+                example.checksum,
+                api_example.checksum.as_deref().unwrap_or("<null>")
+            ));
+        }
+    }
+    None
+}
+
+fn log_failed_examples(batch: &[ImportedExample], message: &str) {
+    for example in batch {
+        error!(
+            external_id = %example.external_id,
+            russian = %example.russian,
+            error = %message,
+            "Example synchronization failed"
+        );
+    }
+}
+
+fn log_failed_example_updates(batch: &[(ApiExample, ImportedExample)], message: &str) {
+    for (_, example) in batch {
+        error!(
+            external_id = %example.external_id,
+            russian = %example.russian,
+            error = %message,
+            "Example synchronization failed"
+        );
     }
 }

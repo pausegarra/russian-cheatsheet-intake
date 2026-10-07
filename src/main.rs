@@ -53,11 +53,13 @@ fn run() -> Result<IntakeSummary> {
     keycloak.get_token()?;
     let api = CheatsheetApi::new(&config.api_base_url, keycloak)?;
     let example_snapshot = source.load_example_snapshot()?;
-    let word_result = SynchronizeWords::new(source, api.clone()).run_with_words()?;
+    let batch_size = config.batch_size;
+    let word_result = SynchronizeWords::new(source, api.clone(), batch_size).run_with_words()?;
     let examples = if word_result.summary.fatal_error.is_some() {
         ExampleSyncSummary::default()
     } else {
-        SynchronizeExamples::new(api).run(example_snapshot, &word_result.words_by_external_id)?
+        SynchronizeExamples::new(api, batch_size)
+            .run(example_snapshot, &word_result.words_by_external_id)?
     };
     Ok(IntakeSummary {
         words: word_result.summary,
