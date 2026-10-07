@@ -4,7 +4,7 @@ use std::path::Path;
 
 const DEFAULT_OPENRUSSIAN_URL: &str =
     "https://app.togetherdb.com/db/fwoedz5fvtwvq03v/openrussian_public/words";
-const DEFAULT_BATCH_SIZE: usize = 1000;
+const MAX_BATCH_SIZE: usize = 1000;
 
 pub struct Config {
     pub api_base_url: String,
@@ -36,13 +36,19 @@ impl Config {
             Ok(value) => {
                 let batch_size = value
                     .parse::<usize>()
-                    .context("RUSSIAN_CHEATSHEET_BATCH_SIZE must be a positive integer")?;
-                if batch_size == 0 {
-                    anyhow::bail!("RUSSIAN_CHEATSHEET_BATCH_SIZE must be greater than zero");
+                    .with_context(|| {
+                        format!(
+                            "RUSSIAN_CHEATSHEET_BATCH_SIZE must be an integer from 1 to {MAX_BATCH_SIZE}"
+                        )
+                    })?;
+                if !(1..=MAX_BATCH_SIZE).contains(&batch_size) {
+                    anyhow::bail!(
+                        "RUSSIAN_CHEATSHEET_BATCH_SIZE must be between 1 and {MAX_BATCH_SIZE}"
+                    );
                 }
                 batch_size
             }
-            Err(env::VarError::NotPresent) => DEFAULT_BATCH_SIZE,
+            Err(env::VarError::NotPresent) => MAX_BATCH_SIZE,
             Err(error) => {
                 return Err(error).context("could not read RUSSIAN_CHEATSHEET_BATCH_SIZE");
             }
