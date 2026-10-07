@@ -1,12 +1,14 @@
 # Russian Cheatsheet Intake
 
-Rust CLI that syncs active OpenRussian words to Russian Cheatsheet API. It loads source words, English translations, verb aspects, audio URLs, English usage, and forms; then creates missing words and updates words whose API checksum differs. Disabled words are skipped. Intake never deletes API words.
+Rust CLI that syncs active OpenRussian words and linked example sentences to Russian Cheatsheet API. It creates missing records, skips records with matching checksums, and updates changed records. Words sync first so each example can link to API word UUIDs. Disabled words and sentences are skipped. Intake never deletes API words or examples.
 
-Intake maps `words.audio` to `audioUrl`, `words.usage_en` to `usage`, and `words_forms.form_bare` to source-named API forms. Repeated forms with the same `form_type` are sorted by source position and row ID, then joined with `; `. Word translation objects contain `language`, `text`, and `position`; `managedBy` is internal to the API. Blank types and aspects stay null; unsupported types and form types fail visibly. Manual API translations remain API-managed.
+Word intake maps `words.audio` to `audioUrl`, `words.usage_en` to `usage`, and `words_forms.form_bare` to source-named API forms. Repeated forms with the same `form_type` are sorted by source position and row ID, then joined with `; `. Word translation objects contain `language`, `text`, and `position`; `managedBy` is internal to the API. Blank types and aspects stay null; unsupported types and form types fail visibly. Manual API translations remain API-managed.
+
+Example intake maps `sentences.id` to API `externalId`, `sentences.ru` to `russian`, nonblank `tl_en` / `tl_de` to English / German translations, and `sentences_words.word_id` to linked API word UUIDs. Translation positions are 0 for English and 1 for German. The source has no sentence audio or contributor fields, so both API values are null. A matching `externalId` with changed content is updated by API UUID; unchanged checksum skips the write. Examples without links to imported API words are skipped. Disabled or removed source sentences do not delete existing API examples. Intake uses `GET /api/examples?externalIdOnly=true` to read only IDs and checksums when building its reconciliation map.
 
 ## Run
 
-Copy `.env.example` to `.env`, then set the API URL and Keycloak client details. Keycloak client must be confidential, have service accounts enabled, and its service account needs `words#create` and `words#update` roles.
+Copy `.env.example` to `.env`, then set the API URL and Keycloak client details. Keycloak client must be confidential, have service accounts enabled, and its service account needs `words#create`, `words#update`, `examples#create`, and `examples#update` roles.
 
 ```sh
 cp .env.example .env
@@ -14,7 +16,7 @@ cp .env.example .env
 cargo run --release
 ```
 
-Logs include UTC timestamps and INFO events for complete source CSV exports, API page progress, and each create, update, or unchanged word. Intake downloads and parses each full CSV in memory without row chunks. Set `RUST_LOG=debug` before `cargo run --release` to see request starts and cached-token reuse.
+Logs include UTC timestamps, source CSV export events, API page progress, word sync outcomes, and INFO events for each example create, update, checksum match, and disabled/unlinked skip; final counts follow. Intake sends one POST or PUT per changed example; the initial full import may take time. HTTP 429 responses honor numeric `Retry-After` values or use capped backoff, up to four retries per request. Intake downloads and parses each full CSV in memory without row chunks. Set `RUST_LOG=debug` before `cargo run --release` to see request starts and cached-token reuse.
 
 Set `KEYCLOAK_TOKEN_URL` to the full OpenID Connect token endpoint URL, usually `https://<host>/realms/<realm>/protocol/openid-connect/token`. Intake uses the `client_credentials` grant. `JwtKeycloakContextHolder.get_token()` checks expiry on every request and renews the token 30 seconds early, using the earlier of JWT `exp` and Keycloak `expires_in`.
 

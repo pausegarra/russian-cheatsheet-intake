@@ -1,5 +1,6 @@
 use crate::application::ports::{
-    SourceForm, SourceSnapshot, SourceTranslation, SourceWord, WordSource,
+    SourceExample, SourceExampleSnapshot, SourceExampleTranslation, SourceForm, SourceSnapshot,
+    SourceTranslation, SourceWord, WordSource,
 };
 use anyhow::{Context, Result, bail};
 use csv::ReaderBuilder;
@@ -186,6 +187,61 @@ impl WordSource for OpenRussianClient {
             translations_by_word_id,
             aspects_by_word_id,
             forms_by_word_id,
+        })
+    }
+
+    fn load_example_snapshot(&self) -> Result<SourceExampleSnapshot> {
+        let sentences = self.fetch_table("sentences", None)?;
+        let sentence_translations = self.fetch_table("sentences_translations", None)?;
+        let sentence_words = self.fetch_table("sentences_words", None)?;
+
+        let mut examples = Vec::with_capacity(sentences.len());
+        for row in sentences {
+            examples.push(SourceExample {
+                id: row.string("sentences", "id")?,
+                russian: row.string("sentences", "ru")?,
+                disabled: row.boolean("sentences", "disabled")?,
+            });
+        }
+
+        let mut translations_by_example_id: HashMap<String, Vec<SourceExampleTranslation>> =
+            HashMap::new();
+        for row in sentence_translations {
+            let sentence_id = row.string("sentences_translations", "sentence_id")?;
+            let translations = translations_by_example_id.entry(sentence_id).or_default();
+            for (language, column, position) in [("en", "tl_en", 0), ("de", "tl_de", 1)] {
+                if let Some(text) = row
+                    .optional_string("sentences_translations", column)?
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    translations.push(SourceExampleTranslation {
+                        language: language.to_owned(),
+                        text,
+                        position,
+                    });
+                }
+            }
+        }
+
+        let mut word_ids_by_example_id: HashMap<String, Vec<String>> = HashMap::new();
+        for row in sentence_words {
+            let sentence_id = row.string("sentences_words", "sentence_id")?;
+            word_ids_by_example_id
+                .entry(sentence_id)
+                .or_default()
+                .push(row.string("sentences_words", "word_id")?);
+        }
+
+        info!(
+            source_examples = examples.len(),
+            translated_sentences = translations_by_example_id.len(),
+            sentence_word_links = word_ids_by_example_id.values().map(Vec::len).sum::<usize>(),
+            "OpenRussian example data loaded"
+        );
+        Ok(SourceExampleSnapshot {
+            examples,
+            translations_by_example_id,
+            word_ids_by_example_id,
         })
     }
 }

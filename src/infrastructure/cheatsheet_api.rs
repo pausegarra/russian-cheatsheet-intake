@@ -1,4 +1,8 @@
-use crate::application::ports::{ApiWord, ApiWriteError, WordsApi, WriteEffect, WriteResult};
+use crate::application::ports::{
+    ApiExample, ApiWord, ApiWriteError, ExampleWriteResult, ExamplesApi, WordsApi, WriteEffect,
+    WriteResult,
+};
+use crate::domain::example::ImportedExample;
 use crate::domain::word::ImportedWord;
 use crate::infrastructure::keycloak::JwtKeycloakContextHolder;
 use anyhow::{Context, Result, bail};
@@ -13,7 +17,10 @@ use url::Url;
 
 const PAGE_SIZE: usize = 1000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_RATE_LIMIT_RETRIES: u32 = 4;
+const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
 pub struct CheatsheetApi {
     http: Client,
     base_url: Url,
@@ -111,6 +118,72 @@ impl CheatsheetApi {
         Ok(words)
     }
 
+    fn find_all_examples(&self) -> Result<HashMap<String, ApiExample>> {
+        let mut examples = HashMap::new();
+        let mut page = 0usize;
+        info!("Starting Russian Cheatsheet API example read");
+
+        loop {
+            debug!(page, page_size = PAGE_SIZE, "Requesting API example page");
+            let mut url = self.base_url.join("examples")?;
+            url.query_pairs_mut()
+                .append_pair("page", &page.to_string())
+                .append_pair("perPage", &PAGE_SIZE.to_string())
+                .append_pair("externalIdOnly", "true");
+            let token = self.keycloak.get_token()?;
+
+            let response: ExamplePage = self
+                .http
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .with_context(|| {
+                    format!("failed to read Russian Cheatsheet API examples page {page}")
+                })?
+                .error_for_status()
+                .with_context(|| format!("Russian Cheatsheet API rejected examples page {page}"))?
+                .json()
+                .with_context(|| {
+                    format!("invalid Russian Cheatsheet API response on examples page {page}")
+                })?;
+
+            let page_example_count = response.data.len();
+            let has_next_page = response.has_next_page;
+            for item in response.data {
+                let Some(external_id) = item.external_id else {
+                    continue;
+                };
+                let example = ApiExample {
+                    id: item.id,
+                    external_id: external_id.clone(),
+                    checksum: item.checksum,
+                };
+                if examples.insert(external_id.clone(), example).is_some() {
+                    bail!(
+                        "Russian Cheatsheet API returned duplicate example externalId={external_id}"
+                    );
+                }
+            }
+
+            info!(
+                page,
+                examples = page_example_count,
+                has_next_page,
+                "Russian Cheatsheet API example page received"
+            );
+            if !has_next_page {
+                break;
+            }
+            page += 1;
+        }
+
+        info!(
+            examples = examples.len(),
+            "Russian Cheatsheet API example read complete"
+        );
+        Ok(examples)
+    }
+
     fn send_word(
         &self,
         method: Method,
@@ -157,6 +230,88 @@ impl CheatsheetApi {
         })
     }
 
+    fn send_example(
+        &self,
+        method: Method,
+        url: Url,
+        example: &ImportedExample,
+        include_external_id: bool,
+    ) -> std::result::Result<ApiExample, ApiWriteError> {
+        let request = example.request(include_external_id);
+        let mut rate_limit_retries = 0;
+        let response = loop {
+            let token = self.keycloak.get_token().map_err(api_error)?;
+            let response = self
+                .http
+                .request(method.clone(), url.clone())
+                .bearer_auth(token)
+                .json(&request)
+                .send()
+                .map_err(|error| ApiWriteError {
+                    message: format!("request failed: {error}"),
+                    outcome_unknown: error.is_timeout() || error.is_connect(),
+                    fatal: false,
+                })?;
+
+            if response.status() != StatusCode::TOO_MANY_REQUESTS
+                || rate_limit_retries >= MAX_RATE_LIMIT_RETRIES
+            {
+                break response;
+            }
+
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|header| header.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let fallback_delay =
+                Duration::from_secs(1u64 << rate_limit_retries).min(MAX_RATE_LIMIT_DELAY);
+            let delay = retry_after
+                .map(Duration::from_secs)
+                .unwrap_or(fallback_delay);
+            warn!(
+                external_id = %example.external_id,
+                retry = rate_limit_retries + 1,
+                delay_seconds = delay.as_secs(),
+                "Example write was rate limited; retrying"
+            );
+            std::thread::sleep(delay);
+            rate_limit_retries += 1;
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .unwrap_or_else(|error| format!("<could not read body: {error}>"));
+            return Err(ApiWriteError {
+                message: format!("API returned {status}: {body}"),
+                outcome_unknown: status == StatusCode::CONFLICT || status.is_server_error(),
+                fatal: status == StatusCode::UNAUTHORIZED
+                    || status == StatusCode::FORBIDDEN
+                    || status.is_server_error(),
+            });
+        }
+
+        let item: ExampleResponse = response.json().map_err(|error| ApiWriteError {
+            message: format!("API returned an unreadable example response: {error}"),
+            outcome_unknown: true,
+            fatal: false,
+        })?;
+        let Some(external_id) = item.external_id else {
+            return Err(ApiWriteError {
+                message: "API returned an example without externalId".to_owned(),
+                outcome_unknown: true,
+                fatal: true,
+            });
+        };
+        Ok(ApiExample {
+            id: item.id,
+            external_id,
+            checksum: item.checksum,
+        })
+    }
+
     fn checked_result(
         &self,
         api_word: ApiWord,
@@ -195,6 +350,44 @@ impl CheatsheetApi {
         Ok(api_word)
     }
 
+    fn checked_example_result(
+        &self,
+        api_example: ApiExample,
+        example: &ImportedExample,
+        expected_id: Option<&str>,
+    ) -> std::result::Result<ApiExample, ApiWriteError> {
+        if api_example.external_id != example.external_id {
+            return Err(ApiWriteError {
+                message: format!(
+                    "API returned externalId={} for requested externalId={}",
+                    api_example.external_id, example.external_id
+                ),
+                outcome_unknown: false,
+                fatal: true,
+            });
+        }
+        if expected_id.is_some_and(|expected| expected != api_example.id) {
+            return Err(ApiWriteError {
+                message: format!("API changed id for externalId={}", example.external_id),
+                outcome_unknown: false,
+                fatal: true,
+            });
+        }
+        if api_example.checksum.as_deref() != Some(example.checksum.as_str()) {
+            return Err(ApiWriteError {
+                message: format!(
+                    "API checksum mismatch for example externalId={}: expected {}, received {}",
+                    example.external_id,
+                    example.checksum,
+                    api_example.checksum.as_deref().unwrap_or("<null>")
+                ),
+                outcome_unknown: false,
+                fatal: true,
+            });
+        }
+        Ok(api_example)
+    }
+
     fn reconcile(
         &self,
         word: &ImportedWord,
@@ -216,6 +409,16 @@ impl CheatsheetApi {
         if let Some(id) = id {
             url.path_segments_mut()
                 .map_err(|_| anyhow::anyhow!("API URL cannot accept word ID"))?
+                .push(id);
+        }
+        Ok(url)
+    }
+
+    fn example_url(&self, id: Option<&str>) -> Result<Url> {
+        let mut url = self.base_url.join("examples")?;
+        if let Some(id) = id {
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("API URL cannot accept example ID"))?
                 .push(id);
         }
         Ok(url)
@@ -303,6 +506,52 @@ impl WordsApi for CheatsheetApi {
     }
 }
 
+impl ExamplesApi for CheatsheetApi {
+    fn find_all_examples_by_external_id(&self) -> Result<HashMap<String, ApiExample>> {
+        self.find_all_examples()
+    }
+
+    fn create_example(
+        &self,
+        example: &ImportedExample,
+    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
+        match self.send_example(
+            Method::POST,
+            self.example_url(None).map_err(api_error)?,
+            example,
+            true,
+        ) {
+            Ok(api_example) => {
+                let api_example = self.checked_example_result(api_example, example, None)?;
+                Ok(ExampleWriteResult {
+                    example: api_example,
+                    effect: WriteEffect::Created,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn update_example(
+        &self,
+        existing: &ApiExample,
+        example: &ImportedExample,
+    ) -> std::result::Result<ExampleWriteResult, ApiWriteError> {
+        let url = self.example_url(Some(&existing.id)).map_err(api_error)?;
+        match self.send_example(Method::PUT, url, example, false) {
+            Ok(api_example) => {
+                let api_example =
+                    self.checked_example_result(api_example, example, Some(&existing.id))?;
+                Ok(ExampleWriteResult {
+                    example: api_example,
+                    effect: WriteEffect::Updated,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn api_error(error: anyhow::Error) -> ApiWriteError {
     ApiWriteError {
         message: format!("{error:#}"),
@@ -329,6 +578,29 @@ struct WordReference {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WordResponse {
+    id: String,
+    external_id: Option<String>,
+    checksum: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExamplePage {
+    data: Vec<ExampleReference>,
+    has_next_page: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExampleReference {
+    id: String,
+    external_id: Option<String>,
+    checksum: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExampleResponse {
     id: String,
     external_id: Option<String>,
     checksum: Option<String>,

@@ -1,5 +1,5 @@
 use crate::application::ports::{
-    SourceForm, SourceSnapshot, SourceWord, WordSource, WordsApi, WriteEffect,
+    ApiWord, SourceForm, SourceSnapshot, SourceWord, WordSource, WordsApi, WriteEffect,
 };
 use crate::domain::word::{ImportedWord, Translation, WORD_FORM_TYPES, WordForms};
 use anyhow::Result;
@@ -23,6 +23,11 @@ pub struct SyncSummary {
     pub fatal_error: Option<String>,
 }
 
+pub struct WordSyncResult {
+    pub summary: SyncSummary,
+    pub words_by_external_id: HashMap<String, ApiWord>,
+}
+
 enum PreparedWord {
     Ready(ImportedWord),
     Invalid {
@@ -36,7 +41,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
         Self { source, api }
     }
 
-    pub fn run(&self) -> Result<SyncSummary> {
+    pub fn run_with_words(&self) -> Result<WordSyncResult> {
         info!("Loading OpenRussian words and related source rows");
         let snapshot = self.source.load_snapshot()?;
         let mut summary = SyncSummary {
@@ -160,7 +165,10 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             }
         }
 
-        Ok(summary)
+        Ok(WordSyncResult {
+            summary,
+            words_by_external_id: existing,
+        })
     }
 }
 

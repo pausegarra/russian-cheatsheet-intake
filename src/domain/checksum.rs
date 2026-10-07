@@ -51,7 +51,7 @@ pub fn calculate(word: &ImportedWord) -> anyhow::Result<String> {
     Ok(format!("{digest:x}"))
 }
 
-fn uppercase_unicode_escape_hex(json: &mut [u8]) {
+pub(crate) fn uppercase_unicode_escape_hex(json: &mut [u8]) {
     // Jackson's canonical checksum JSON uses uppercase hex digits in `\u` escapes.
     let mut index = 0;
     while index < json.len() {
@@ -71,7 +71,7 @@ fn uppercase_unicode_escape_hex(json: &mut [u8]) {
     }
 }
 
-fn compare_java_strings(left: &str, right: &str) -> Ordering {
+pub(crate) fn compare_java_strings(left: &str, right: &str) -> Ordering {
     left.encode_utf16().cmp(right.encode_utf16())
 }
 
