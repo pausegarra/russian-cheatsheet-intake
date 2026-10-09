@@ -14,6 +14,7 @@ pub struct ExampleSyncSummary {
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
+    pub deleted: usize,
     pub failed: usize,
     pub fatal_error: Option<String>,
 }
@@ -52,6 +53,7 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
             api_examples = existing.len(),
             "Russian Cheatsheet examples loaded"
         );
+        let mut deletion_candidates = existing.clone();
 
         let mut creates = Vec::new();
         let mut updates = Vec::new();
@@ -67,6 +69,8 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
                 );
                 continue;
             }
+
+            deletion_candidates.remove(&source_example.id);
 
             let linked_word_ids = word_ids_by_example_id
                 .remove(&source_example.id)
@@ -180,6 +184,13 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
             }
         }
 
+        if !stop && summary.fatal_error.is_none() {
+            self.delete_stale_examples(
+                &deletion_candidates.into_values().collect::<Vec<_>>(),
+                &mut summary,
+            );
+        }
+
         info!(
             scanned = summary.scanned,
             disabled_skipped = summary.disabled_skipped,
@@ -187,10 +198,86 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
             created = summary.created,
             updated = summary.updated,
             unchanged = summary.unchanged,
+            deleted = summary.deleted,
             failed = summary.failed,
             "OpenRussian example sync complete"
         );
         Ok(summary)
+    }
+
+    fn delete_stale_examples(
+        &self,
+        stale_examples: &[ApiExample],
+        summary: &mut ExampleSyncSummary,
+    ) {
+        let batch_size = self.batch_size.max(1);
+        let mut start = 0;
+        while start < stale_examples.len() {
+            let end = (start + batch_size).min(stale_examples.len());
+            let batch = &stale_examples[start..end];
+            match self.api.delete_examples_batch(batch) {
+                Ok(()) => {
+                    summary.deleted += batch.len();
+                    info!(examples = batch.len(), "Stale examples deleted");
+                    start = end;
+                }
+                Err(write_error) if write_error.outcome_unknown => {
+                    match self.api.find_all_examples_by_external_id() {
+                        Ok(refreshed) => {
+                            let unresolved = batch
+                                .iter()
+                                .filter(|requested| {
+                                    refreshed
+                                        .get(&requested.external_id)
+                                        .is_some_and(|current| current.id == requested.id)
+                                })
+                                .count();
+                            summary.deleted += batch.len() - unresolved;
+                            if unresolved == 0 {
+                                info!(
+                                    examples = batch.len(),
+                                    "Stale example delete outcome reconciled"
+                                );
+                                start = end;
+                            } else {
+                                let not_attempted = stale_examples.len() - end;
+                                summary.failed += unresolved + not_attempted;
+                                summary.fatal_error = Some(format!(
+                                    "{}; {unresolved} stale examples remain after reconciliation",
+                                    write_error.message
+                                ));
+                                error!(
+                                    unresolved_examples = unresolved,
+                                    not_attempted, "Stale example deletes unresolved"
+                                );
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let not_attempted = stale_examples.len() - end;
+                            summary.failed += batch.len() + not_attempted;
+                            summary.fatal_error = Some(format!(
+                                "{}; could not reconcile example deletes: {error:#}",
+                                write_error.message
+                            ));
+                            break;
+                        }
+                    }
+                }
+                Err(write_error) => {
+                    let not_attempted = stale_examples.len() - end;
+                    summary.failed += batch.len() + not_attempted;
+                    summary.fatal_error = Some(write_error.message.clone());
+                    error!(
+                        examples = batch.len(),
+                        not_attempted,
+                        error = %write_error.message,
+                        "Stale example delete failed"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn flush_creates(

@@ -4,7 +4,7 @@ use crate::application::ports::{
 use crate::domain::word::{ImportedWord, Translation, WORD_FORM_TYPES, WordForms};
 use anyhow::Result;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
 pub struct SynchronizeWords<S, A> {
@@ -20,6 +20,7 @@ pub struct SyncSummary {
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
+    pub deleted: usize,
     pub failed: usize,
     pub fatal_error: Option<String>,
 }
@@ -27,6 +28,8 @@ pub struct SyncSummary {
 pub struct WordSyncResult {
     pub summary: SyncSummary,
     pub words_by_external_id: HashMap<String, ApiWord>,
+    pub active_source_word_ids: HashSet<String>,
+    pub stale_words: Vec<ApiWord>,
 }
 
 enum PreparedWord {
@@ -53,6 +56,12 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             scanned: snapshot.words.len(),
             ..SyncSummary::default()
         };
+        let active_source_word_ids = snapshot
+            .words
+            .iter()
+            .filter(|word| !word.disabled)
+            .map(|word| word.id.clone())
+            .collect::<HashSet<_>>();
         let english_translation_count = snapshot
             .translations_by_word_id
             .values()
@@ -79,6 +88,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             api_words = existing.len(),
             "Russian Cheatsheet words loaded"
         );
+        let mut deletion_candidates = existing.clone();
 
         let mut creates = Vec::new();
         let mut updates = Vec::new();
@@ -91,6 +101,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                     external_id,
                     message,
                 } => {
+                    deletion_candidates.remove(&external_id);
                     warn!(
                         external_id,
                         error = %message,
@@ -100,6 +111,8 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                     continue;
                 }
             };
+
+            deletion_candidates.remove(&word.external_id);
 
             match existing.get(&word.external_id) {
                 Some(api_word) if api_word.checksum.as_deref() == Some(word.checksum.as_str()) => {
@@ -169,10 +182,83 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             }
         }
 
+        let stale_words = deletion_candidates.into_values().collect::<Vec<_>>();
+        existing.retain(|external_id, _| active_source_word_ids.contains(external_id));
+
         Ok(WordSyncResult {
             summary,
             words_by_external_id: existing,
+            active_source_word_ids,
+            stale_words,
         })
+    }
+
+    pub fn delete_stale_words(&self, stale_words: &[ApiWord], summary: &mut SyncSummary) {
+        let batch_size = self.batch_size.max(1);
+        let mut start = 0;
+        while start < stale_words.len() {
+            let end = (start + batch_size).min(stale_words.len());
+            let batch = &stale_words[start..end];
+            match self.api.delete_words_batch(batch) {
+                Ok(()) => {
+                    summary.deleted += batch.len();
+                    info!(words = batch.len(), "Stale words deleted");
+                    start = end;
+                }
+                Err(write_error) if write_error.outcome_unknown => {
+                    match self.api.find_all_by_external_id() {
+                        Ok(refreshed) => {
+                            let unresolved = batch
+                                .iter()
+                                .filter(|requested| {
+                                    refreshed
+                                        .get(&requested.external_id)
+                                        .is_some_and(|current| current.id == requested.id)
+                                })
+                                .count();
+                            summary.deleted += batch.len() - unresolved;
+                            if unresolved == 0 {
+                                info!(words = batch.len(), "Stale word delete outcome reconciled");
+                                start = end;
+                            } else {
+                                let not_attempted = stale_words.len() - end;
+                                summary.failed += unresolved + not_attempted;
+                                summary.fatal_error = Some(format!(
+                                    "{}; {unresolved} stale words remain after reconciliation",
+                                    write_error.message
+                                ));
+                                error!(
+                                    unresolved_words = unresolved,
+                                    not_attempted, "Stale word deletes unresolved"
+                                );
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let not_attempted = stale_words.len() - end;
+                            summary.failed += batch.len() + not_attempted;
+                            summary.fatal_error = Some(format!(
+                                "{}; could not reconcile word deletes: {error:#}",
+                                write_error.message
+                            ));
+                            break;
+                        }
+                    }
+                }
+                Err(write_error) => {
+                    let not_attempted = stale_words.len() - end;
+                    summary.failed += batch.len() + not_attempted;
+                    summary.fatal_error = Some(write_error.message.clone());
+                    error!(
+                        words = batch.len(),
+                        not_attempted,
+                        error = %write_error.message,
+                        "Stale word delete failed"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn flush_creates(

@@ -1,4 +1,7 @@
-use crate::application::ports::{ApiExample, ApiWord, ApiWriteError, ExamplesApi, WordsApi};
+use crate::application::ports::{
+    ApiExample, ApiWord, ApiWordRelation, ApiWordRelationCreate, ApiWordRelationResult,
+    ApiWriteError, ExamplesApi, WordRelationsApi, WordsApi,
+};
 use crate::domain::example::ImportedExample;
 use crate::domain::word::ImportedWord;
 use crate::infrastructure::keycloak::JwtKeycloakContextHolder;
@@ -6,13 +9,14 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use url::Url;
 
 const PAGE_SIZE: usize = 1000;
+const RELATION_PAGE_SIZE: usize = 100;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
@@ -59,7 +63,7 @@ impl CheatsheetApi {
 
         loop {
             debug!(page, page_size = PAGE_SIZE, "Requesting API word page");
-            let mut url = self.base_url.join("words")?;
+            let mut url = self.base_url.join("v1/words")?;
             url.query_pairs_mut()
                 .append_pair("page", &page.to_string())
                 .append_pair("perPage", &PAGE_SIZE.to_string());
@@ -122,7 +126,7 @@ impl CheatsheetApi {
 
         loop {
             debug!(page, page_size = PAGE_SIZE, "Requesting API example page");
-            let mut url = self.base_url.join("examples")?;
+            let mut url = self.base_url.join("v1/examples")?;
             url.query_pairs_mut()
                 .append_pair("page", &page.to_string())
                 .append_pair("perPage", &PAGE_SIZE.to_string())
@@ -179,6 +183,81 @@ impl CheatsheetApi {
             "Russian Cheatsheet API example read complete"
         );
         Ok(examples)
+    }
+
+    fn find_all_word_relations(&self) -> Result<Vec<ApiWordRelation>> {
+        let mut relations = Vec::new();
+        let mut identities = HashSet::new();
+        let mut page = 0usize;
+        info!("Starting Russian Cheatsheet API word relation read");
+
+        loop {
+            debug!(
+                page,
+                page_size = RELATION_PAGE_SIZE,
+                "Requesting API word relation page"
+            );
+            let mut url = self.base_url.join("v1/words/relations")?;
+            url.query_pairs_mut()
+                .append_pair("page", &page.to_string())
+                .append_pair("perPage", &RELATION_PAGE_SIZE.to_string());
+            let token = self.keycloak.get_token()?;
+
+            let response: WordRelationPage = self
+                .http
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .with_context(|| {
+                    format!("failed to read Russian Cheatsheet API word relations page {page}")
+                })?
+                .error_for_status()
+                .with_context(|| {
+                    format!("Russian Cheatsheet API rejected word relations page {page}")
+                })?
+                .json()
+                .with_context(|| {
+                    format!("invalid Russian Cheatsheet API response on relations page {page}")
+                })?;
+
+            let page_relation_count = response.data.len();
+            let has_next_page = response.has_next_page;
+            for item in response.data {
+                let relation = ApiWordRelation {
+                    source_word_id: item.source_word_id,
+                    source_external_id: item.source_external_id,
+                    related_word_id: item.related_word_id,
+                    related_external_id: item.related_external_id,
+                    relation: item.relation,
+                };
+                if !identities.insert(relation.api_identity()) {
+                    bail!(
+                        "Russian Cheatsheet API returned duplicate word relation {} -> {} ({})",
+                        relation.source_word_id,
+                        relation.related_word_id,
+                        relation.relation
+                    );
+                }
+                relations.push(relation);
+            }
+
+            info!(
+                page,
+                word_relations = page_relation_count,
+                has_next_page,
+                "Russian Cheatsheet API word relation page received"
+            );
+            if !has_next_page {
+                break;
+            }
+            page += 1;
+        }
+
+        info!(
+            word_relations = relations.len(),
+            "Russian Cheatsheet API word relation read complete"
+        );
+        Ok(relations)
     }
 
     fn send_batch_request<T: Serialize>(
@@ -361,7 +440,7 @@ impl WordsApi for CheatsheetApi {
         let response = self.send_batch_request(
             Method::POST,
             self.base_url
-                .join("words/batch")
+                .join("v1/words/batch")
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "words",
@@ -407,7 +486,7 @@ impl WordsApi for CheatsheetApi {
         let response = self.send_batch_request(
             Method::PUT,
             self.base_url
-                .join("words/batch")
+                .join("v1/words/batch")
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "words",
@@ -437,6 +516,27 @@ impl WordsApi for CheatsheetApi {
             })
             .collect()
     }
+
+    fn delete_words_batch(&self, words: &[ApiWord]) -> std::result::Result<(), ApiWriteError> {
+        if words.is_empty() {
+            return Ok(());
+        }
+
+        let ids = words
+            .iter()
+            .map(|word| word.id.as_str())
+            .collect::<Vec<_>>();
+        self.send_batch_request(
+            Method::DELETE,
+            self.base_url
+                .join("v1/words/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &ids,
+            "words",
+            true,
+        )?;
+        Ok(())
+    }
 }
 
 impl ExamplesApi for CheatsheetApi {
@@ -459,7 +559,7 @@ impl ExamplesApi for CheatsheetApi {
         let response = self.send_batch_request(
             Method::POST,
             self.base_url
-                .join("examples/batch")
+                .join("v1/examples/batch")
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "examples",
@@ -512,7 +612,7 @@ impl ExamplesApi for CheatsheetApi {
         let response = self.send_batch_request(
             Method::PUT,
             self.base_url
-                .join("examples/batch")
+                .join("v1/examples/batch")
                 .map_err(|error| api_error(error.into()))?,
             &requests,
             "examples",
@@ -548,6 +648,150 @@ impl ExamplesApi for CheatsheetApi {
                 .map_err(mark_batch_integrity_error)
             })
             .collect()
+    }
+
+    fn delete_examples_batch(
+        &self,
+        examples: &[ApiExample],
+    ) -> std::result::Result<(), ApiWriteError> {
+        if examples.is_empty() {
+            return Ok(());
+        }
+
+        let ids = examples
+            .iter()
+            .map(|example| example.id.as_str())
+            .collect::<Vec<_>>();
+        self.send_batch_request(
+            Method::DELETE,
+            self.base_url
+                .join("v1/examples/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &ids,
+            "examples",
+            true,
+        )?;
+        Ok(())
+    }
+}
+
+impl WordRelationsApi for CheatsheetApi {
+    fn find_all_word_relations(&self) -> Result<Vec<ApiWordRelation>> {
+        CheatsheetApi::find_all_word_relations(self)
+    }
+
+    fn create_word_relations_batch(
+        &self,
+        relations: &[ApiWordRelationCreate],
+    ) -> std::result::Result<Vec<ApiWordRelationResult>, ApiWriteError> {
+        if relations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests = relations
+            .iter()
+            .map(|relation| WordRelationRequest {
+                word_id: &relation.word_id,
+                related_word_id: &relation.related_word_id,
+                relation: &relation.key.relation,
+            })
+            .collect::<Vec<_>>();
+        let response = self.send_batch_request(
+            Method::POST,
+            self.base_url
+                .join("v1/words/relations/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "word relations",
+            true,
+        )?;
+        let items: Vec<WordRelationBatchResponse> =
+            response.json().map_err(|error| ApiWriteError {
+                message: format!(
+                    "API returned an unreadable word relations batch response: {error}"
+                ),
+                outcome_unknown: true,
+                fatal: false,
+            })?;
+        if items.len() != relations.len() {
+            return Err(mark_batch_integrity_error(ApiWriteError {
+                message: format!(
+                    "API returned {} word relations for batch of {}",
+                    items.len(),
+                    relations.len()
+                ),
+                outcome_unknown: true,
+                fatal: true,
+            }));
+        }
+
+        relations
+            .iter()
+            .zip(items)
+            .map(|(requested, item)| {
+                if item.word_id != requested.word_id
+                    || item.relation.related_word_id != requested.related_word_id
+                    || item.relation.relation != requested.key.relation
+                {
+                    return Err(mark_batch_integrity_error(ApiWriteError {
+                        message: format!(
+                            "API returned word relation {} -> {} ({}) for requested {} -> {} ({})",
+                            item.word_id,
+                            item.relation.related_word_id,
+                            item.relation.relation,
+                            requested.word_id,
+                            requested.related_word_id,
+                            requested.key.relation
+                        ),
+                        outcome_unknown: true,
+                        fatal: true,
+                    }));
+                }
+                if item.relation.checksum.as_deref().is_none_or(str::is_empty) {
+                    return Err(mark_batch_integrity_error(ApiWriteError {
+                        message: format!(
+                            "API returned no checksum for word relation {} -> {} ({})",
+                            requested.word_id, requested.related_word_id, requested.key.relation
+                        ),
+                        outcome_unknown: true,
+                        fatal: true,
+                    }));
+                }
+
+                Ok(ApiWordRelationResult {
+                    key: requested.key.clone(),
+                    created: item.created,
+                })
+            })
+            .collect()
+    }
+
+    fn delete_word_relations_batch(
+        &self,
+        relations: &[ApiWordRelation],
+    ) -> std::result::Result<(), ApiWriteError> {
+        if relations.is_empty() {
+            return Ok(());
+        }
+
+        let requests = relations
+            .iter()
+            .map(|relation| WordRelationRequest {
+                word_id: &relation.source_word_id,
+                related_word_id: &relation.related_word_id,
+                relation: &relation.relation,
+            })
+            .collect::<Vec<_>>();
+        self.send_batch_request(
+            Method::DELETE,
+            self.base_url
+                .join("v1/words/relations/batch")
+                .map_err(|error| api_error(error.into()))?,
+            &requests,
+            "word relations",
+            true,
+        )?;
+        Ok(())
     }
 }
 
@@ -608,4 +852,73 @@ struct ExampleResponse {
     id: String,
     external_id: Option<String>,
     checksum: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WordRelationRequest<'a> {
+    word_id: &'a str,
+    related_word_id: &'a str,
+    relation: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WordRelationPage {
+    data: Vec<WordRelationReference>,
+    has_next_page: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WordRelationReference {
+    source_word_id: String,
+    source_external_id: Option<String>,
+    related_word_id: String,
+    related_external_id: Option<String>,
+    relation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WordRelationBatchResponse {
+    word_id: String,
+    created: bool,
+    relation: WordRelationResult,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WordRelationResult {
+    related_word_id: String,
+    relation: String,
+    checksum: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WordRelationReference;
+
+    #[test]
+    fn keeps_relation_uuids_when_endpoint_external_ids_are_missing() {
+        let relation: WordRelationReference = serde_json::from_str(
+            r#"{
+              "sourceWordId":"manual-source-uuid",
+              "sourceExternalId":null,
+              "relatedWordId":"imported-target-uuid",
+              "relatedExternalId":"openrussian-target",
+              "relation":"synonym"
+            }"#,
+        )
+        .expect("API relation row deserializes");
+
+        assert_eq!(relation.source_word_id, "manual-source-uuid");
+        assert_eq!(relation.source_external_id, None);
+        assert_eq!(relation.related_word_id, "imported-target-uuid");
+        assert_eq!(
+            relation.related_external_id.as_deref(),
+            Some("openrussian-target")
+        );
+        assert_eq!(relation.relation, "synonym");
+    }
 }

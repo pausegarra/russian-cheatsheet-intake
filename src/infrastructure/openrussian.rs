@@ -1,6 +1,6 @@
 use crate::application::ports::{
     SourceExample, SourceExampleSnapshot, SourceExampleTranslation, SourceForm, SourceSnapshot,
-    SourceTranslation, SourceWord, WordSource,
+    SourceTranslation, SourceWord, SourceWordRelation, SourceWordRelationSnapshot, WordSource,
 };
 use anyhow::{Context, Result, bail};
 use csv::ReaderBuilder;
@@ -243,6 +243,24 @@ impl WordSource for OpenRussianClient {
             translations_by_example_id,
             word_ids_by_example_id,
         })
+    }
+
+    fn load_word_relation_snapshot(&self) -> Result<SourceWordRelationSnapshot> {
+        let rows = self.fetch_table("words_rels", None)?;
+        let mut relations = Vec::with_capacity(rows.len());
+        for row in rows {
+            relations.push(SourceWordRelation {
+                word_id: row.string("words_rels", "word_id")?,
+                related_word_id: row.string("words_rels", "rel_word_id")?,
+                relation: row.string("words_rels", "relation")?,
+            });
+        }
+
+        info!(
+            source_word_relations = relations.len(),
+            "OpenRussian word relations loaded"
+        );
+        Ok(SourceWordRelationSnapshot { relations })
     }
 }
 

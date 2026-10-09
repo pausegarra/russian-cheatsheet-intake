@@ -52,6 +52,17 @@ pub struct SourceExampleTranslation {
     pub position: i32,
 }
 
+#[derive(Default)]
+pub struct SourceWordRelationSnapshot {
+    pub relations: Vec<SourceWordRelation>,
+}
+
+pub struct SourceWordRelation {
+    pub word_id: String,
+    pub related_word_id: String,
+    pub relation: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ApiWord {
     pub id: String,
@@ -64,6 +75,52 @@ pub struct ApiExample {
     pub id: String,
     pub external_id: String,
     pub checksum: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WordRelationKey {
+    pub source_external_id: String,
+    pub related_external_id: String,
+    pub relation: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApiWordRelationCreate {
+    pub key: WordRelationKey,
+    pub word_id: String,
+    pub related_word_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ApiWordRelation {
+    pub source_word_id: String,
+    pub source_external_id: Option<String>,
+    pub related_word_id: String,
+    pub related_external_id: Option<String>,
+    pub relation: String,
+}
+
+impl ApiWordRelation {
+    pub fn source_key(&self) -> Option<WordRelationKey> {
+        Some(WordRelationKey {
+            source_external_id: self.source_external_id.clone()?,
+            related_external_id: self.related_external_id.clone()?,
+            relation: self.relation.clone(),
+        })
+    }
+
+    pub fn api_identity(&self) -> (String, String, String) {
+        (
+            self.source_word_id.clone(),
+            self.related_word_id.clone(),
+            self.relation.clone(),
+        )
+    }
+}
+
+pub struct ApiWordRelationResult {
+    pub key: WordRelationKey,
+    pub created: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +144,10 @@ pub trait WordSource {
     fn load_example_snapshot(&self) -> Result<SourceExampleSnapshot> {
         Ok(SourceExampleSnapshot::default())
     }
+
+    fn load_word_relation_snapshot(&self) -> Result<SourceWordRelationSnapshot> {
+        Ok(SourceWordRelationSnapshot::default())
+    }
 }
 
 pub trait WordsApi {
@@ -101,6 +162,8 @@ pub trait WordsApi {
         &self,
         updates: &[(ApiWord, ImportedWord)],
     ) -> std::result::Result<Vec<ApiWord>, ApiWriteError>;
+
+    fn delete_words_batch(&self, words: &[ApiWord]) -> std::result::Result<(), ApiWriteError>;
 }
 
 pub trait ExamplesApi {
@@ -115,4 +178,23 @@ pub trait ExamplesApi {
         &self,
         updates: &[(ApiExample, ImportedExample)],
     ) -> std::result::Result<Vec<ApiExample>, ApiWriteError>;
+
+    fn delete_examples_batch(
+        &self,
+        examples: &[ApiExample],
+    ) -> std::result::Result<(), ApiWriteError>;
+}
+
+pub trait WordRelationsApi {
+    fn find_all_word_relations(&self) -> Result<Vec<ApiWordRelation>>;
+
+    fn create_word_relations_batch(
+        &self,
+        relations: &[ApiWordRelationCreate],
+    ) -> std::result::Result<Vec<ApiWordRelationResult>, ApiWriteError>;
+
+    fn delete_word_relations_batch(
+        &self,
+        relations: &[ApiWordRelation],
+    ) -> std::result::Result<(), ApiWriteError>;
 }
