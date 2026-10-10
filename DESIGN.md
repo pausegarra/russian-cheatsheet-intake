@@ -34,15 +34,15 @@ Read these tables:
 | `verbs` | `word_id` and `aspect` → API `aspect`; null or blank remains null |
 | `words_forms` | `word_id`, `form_type`, `position`, `id`, and `form_bare` → API `forms`; sort by position then ID and join repeated values with `; ` |
 | `words_rels` | `word_id`, `rel_word_id`, and `relation` → directed API word relation; also create the inverse direction |
-| `sentences` | `id` → API example `externalId`; `ru` → `russian`; import only `disabled = false` |
+| `sentences` | `id` → API example `externalId`; `ru` → `russian` after removing ASCII apostrophe stress markers; import only `disabled = false` |
 | `sentences_translations` | nonblank `tl_en` / `tl_de` → English / German example translations at positions 0 / 1 |
 | `sentences_words` | `sentence_id` and `word_id` → source sentence links, mapped to API word UUIDs |
 
-Use `words.bare` and `words_forms.form_bare`, never their accented counterparts. Preserve text exactly; do not trim or normalize Unicode. Send `forms: null` only when no usable source form rows exist. Send the complete API forms object with absent supported fields set to null. If forms exist but source type is blank, report that word as a sync failure because API rejects forms without a type. Preserve nullable `words.audio` and `words.usage_en` as API null.
+Use `words.bare` and `words_forms.form_bare`, never their accented counterparts. Preserve word text exactly; do not trim or normalize Unicode. Send `forms: null` only when no usable source form rows exist. Send the complete API forms object with absent supported fields set to null. If forms exist but source type is blank, report that word as a sync failure because API rejects forms without a type. Preserve nullable `words.audio` and `words.usage_en` as API null.
 
 Send an empty translations array when a word has no English translations. Word translation objects contain `language`, `text`, and source `position`; API uses array index only when position is missing. Preserve positions for display, but exclude them from the checksum. Reject unknown nonblank word types and form types instead of silently mapping or dropping them.
 
-Preserve sentence Russian and translation text exactly. The source does not include contributor or sentence audio fields; send null. Remove repeated links and map only word IDs present in the API word map. Skip a sentence if no linked word maps to an API UUID. The API stores the OpenRussian sentence ID in a nullable, unique `externalId`; manually created examples have null identity.
+Remove ASCII `'` stress markers from OpenRussian sentence Russian text before checksum calculation and API writes. Preserve translations and every other sentence character exactly. The source does not include contributor or sentence audio fields; send null. Remove repeated links and map only word IDs present in the API word map. Skip a sentence if no linked word maps to an API UUID. The API stores the OpenRussian sentence ID in a nullable, unique `externalId`; manually created examples have null identity.
 
 ## API synchronization
 

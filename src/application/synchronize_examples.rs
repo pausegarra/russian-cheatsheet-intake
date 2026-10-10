@@ -104,7 +104,7 @@ impl<A: ExamplesApi> SynchronizeExamples<A> {
                 .collect();
             let example = ImportedExample::new(
                 source_example.id.clone(),
-                source_example.russian.clone(),
+                source_example.russian.replace('\'', ""),
                 translations,
                 None,
                 None,
