@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 const PAGE_SIZE: usize = 1000;
-const RELATION_PAGE_SIZE: usize = 100;
+const RELATION_PAGE_SIZE: usize = 1000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
