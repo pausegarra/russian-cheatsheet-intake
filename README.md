@@ -14,6 +14,8 @@ Relation intake maps `words_rels.word_id` and `words_rels.rel_word_id` to API wo
 
 Copy `.env.example` to `.env`, then set the API URL and Keycloak client details. Keycloak client must be confidential, have service accounts enabled, and its service account needs `words#create`, `words#update`, `words#delete`, `examples#create`, `examples#update`, and `examples#delete` roles.
 
+The build embeds `.env` in the executable, so the binary can start without an adjacent `.env` file. Process environment variables take precedence, followed by a runtime `.env`, then embedded values. Rebuild after changing `.env`. The embedded file includes `KEYCLOAK_CLIENT_SECRET`; treat the executable as a secret and limit its distribution.
+
 ```sh
 cp .env.example .env
 # Fill RUSSIAN_CHEATSHEET_API_URL, KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET

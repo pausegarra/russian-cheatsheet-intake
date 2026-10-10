@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use std::env;
 use std::path::Path;
 
+mod embedded_env {
+    include!(concat!(env!("OUT_DIR"), "/embedded_env.rs"));
+}
+
 const DEFAULT_OPENRUSSIAN_URL: &str =
     "https://app.togetherdb.com/db/fwoedz5fvtwvq03v/openrussian_public/words";
 const DEFAULT_BATCH_SIZE: usize = 1000;
@@ -19,6 +23,10 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         if Path::new(".env").is_file() {
             dotenvy::dotenv().context("could not load .env")?;
+        }
+        if !embedded_env::EMBEDDED_ENV.is_empty() {
+            dotenvy::from_read(embedded_env::EMBEDDED_ENV.as_bytes())
+                .context("could not load embedded .env")?;
         }
 
         let api_base_url = env::var("RUSSIAN_CHEATSHEET_API_URL").context(
