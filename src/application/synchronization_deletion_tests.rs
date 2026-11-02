@@ -167,6 +167,7 @@ fn stale_words_exclude_disabled_and_preserve_active_invalid_source_words() {
             SourceWord {
                 id: active_external_id.clone(),
                 russian: "активный".to_owned(),
+                russian_accented: None,
                 source_type: None,
                 disabled: false,
                 audio_url: None,
@@ -175,6 +176,7 @@ fn stale_words_exclude_disabled_and_preserve_active_invalid_source_words() {
             SourceWord {
                 id: disabled_external_id.clone(),
                 russian: "отключённый".to_owned(),
+                russian_accented: None,
                 source_type: Some("noun".to_owned()),
                 disabled: true,
                 audio_url: None,

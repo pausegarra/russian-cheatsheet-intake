@@ -79,6 +79,7 @@ pub struct Translation {
 pub struct ImportedWord {
     pub external_id: String,
     pub russian: String,
+    pub russian_accented: Option<String>,
     pub word_type: Option<String>,
     pub aspect: Option<String>,
     pub translations: Vec<Translation>,
@@ -92,6 +93,7 @@ impl ImportedWord {
     pub fn new(
         external_id: String,
         russian: String,
+        russian_accented: Option<String>,
         word_type: Option<String>,
         aspect: Option<String>,
         translations: Vec<Translation>,
@@ -102,6 +104,7 @@ impl ImportedWord {
         let mut word = Self {
             external_id,
             russian,
+            russian_accented: russian_accented.filter(|value| !value.trim().is_empty()),
             word_type,
             aspect,
             translations,
@@ -117,6 +120,7 @@ impl ImportedWord {
     pub fn request(&self) -> WordWriteRequest<'_> {
         WordWriteRequest {
             russian: &self.russian,
+            russian_accented: self.russian_accented.as_deref(),
             word_type: self.word_type.as_deref(),
             aspect: self.aspect.as_deref(),
             forms: self.forms.as_ref(),
@@ -143,6 +147,7 @@ impl ImportedWord {
 #[serde(rename_all = "camelCase")]
 pub struct WordWriteRequest<'a> {
     pub russian: &'a str,
+    pub russian_accented: Option<&'a str>,
     #[serde(rename = "type")]
     pub word_type: Option<&'a str>,
     pub aspect: Option<&'a str>,

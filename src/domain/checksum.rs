@@ -10,6 +10,8 @@ struct CanonicalWord<'a> {
     audio_url: Option<&'a str>,
     forms: Option<&'a crate::domain::word::WordForms>,
     russian: &'a str,
+    #[serde(rename = "russianAccented")]
+    russian_accented: Option<&'a str>,
     translations: Vec<CanonicalTranslation<'a>>,
     #[serde(rename = "type")]
     word_type: Option<&'a str>,
@@ -34,6 +36,7 @@ pub fn calculate(word: &ImportedWord) -> anyhow::Result<String> {
         audio_url: word.audio_url.as_deref(),
         forms: word.forms.as_ref(),
         russian: &word.russian,
+        russian_accented: word.russian_accented.as_deref(),
         translations: translations
             .into_iter()
             .map(|translation| CanonicalTranslation {
@@ -84,6 +87,7 @@ mod tests {
         let word = ImportedWord::new(
             "1".to_owned(),
             "тест".to_owned(),
+            None,
             Some("other".to_owned()),
             None,
             vec![Translation {
@@ -99,7 +103,7 @@ mod tests {
 
         assert_eq!(
             word.checksum,
-            "788ca2a6fd87438c570fc9b8fc2cab9f45ced61e24f3a7b6b2fa962678c5519e"
+            "6923ea78128d59384c564fc0f612ca9ead497a42f37cc00dc6cde102eb72e1e2"
         );
     }
 }

@@ -1,5 +1,6 @@
 use crate::application::ports::{
-    ApiWord, ApiWriteError, SourceForm, SourceSnapshot, SourceWord, WordSource, WordsApi,
+    ApiWord, ApiWriteError, SourceForm, SourceSnapshot, SourceWord, SpanishTranslationSource,
+    WordSource, WordsApi,
 };
 use crate::domain::word::{ImportedWord, Translation, WORD_FORM_TYPES, WordForms};
 use anyhow::Result;
@@ -11,12 +12,15 @@ pub struct SynchronizeWords<S, A> {
     source: S,
     api: A,
     batch_size: usize,
+    spanish_translation_source: Option<Box<dyn SpanishTranslationSource>>,
 }
 
 #[derive(Default)]
 pub struct SyncSummary {
     pub scanned: usize,
     pub disabled_skipped: usize,
+    pub spanish_translated: usize,
+    pub spanish_pending: usize,
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
@@ -32,10 +36,11 @@ pub struct WordSyncResult {
     pub stale_words: Vec<ApiWord>,
 }
 
-enum PreparedWord {
+pub(crate) enum PreparedWord {
     Ready(ImportedWord),
     Invalid {
         external_id: String,
+        russian: String,
         message: String,
     },
 }
@@ -46,7 +51,16 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             source,
             api,
             batch_size,
+            spanish_translation_source: None,
         }
+    }
+
+    pub fn with_spanish_translation_source<T: SpanishTranslationSource + 'static>(
+        mut self,
+        source: T,
+    ) -> Self {
+        self.spanish_translation_source = Some(Box::new(source));
+        self
     }
 
     pub fn run_with_words(&self) -> Result<WordSyncResult> {
@@ -74,8 +88,24 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
             "OpenRussian source data loaded"
         );
 
+        let spanish_translation_map = if let Some(source) = &self.spanish_translation_source {
+            let russian_words = snapshot
+                .words
+                .iter()
+                .filter(|word| !word.disabled)
+                .map(|word| word.russian.clone())
+                .collect::<Vec<_>>();
+            source.find_spanish_translations(&russian_words)?
+        } else {
+            HashMap::new()
+        };
+
         info!("Calculating expected word checksums");
-        let prepared = prepare_words(snapshot, &mut summary);
+        let prepared = prepare_words_with_spanish_translations(
+            snapshot,
+            &mut summary,
+            &spanish_translation_map,
+        );
         info!(
             active_words = prepared.len(),
             disabled_skipped = summary.disabled_skipped,
@@ -100,6 +130,7 @@ impl<S: WordSource, A: WordsApi> SynchronizeWords<S, A> {
                 PreparedWord::Invalid {
                     external_id,
                     message,
+                    ..
                 } => {
                     deletion_candidates.remove(&external_id);
                     warn!(
@@ -564,7 +595,16 @@ fn log_failed_word_updates(batch: &[(ApiWord, ImportedWord)], message: &str) {
     }
 }
 
+#[cfg(test)]
 fn prepare_words(snapshot: SourceSnapshot, summary: &mut SyncSummary) -> Vec<PreparedWord> {
+    prepare_words_with_spanish_translations(snapshot, summary, &HashMap::new())
+}
+
+pub(crate) fn prepare_words_with_spanish_translations(
+    snapshot: SourceSnapshot,
+    summary: &mut SyncSummary,
+    spanish_translations_by_russian: &HashMap<String, Vec<String>>,
+) -> Vec<PreparedWord> {
     let SourceSnapshot {
         words,
         mut translations_by_word_id,
@@ -584,8 +624,19 @@ fn prepare_words(snapshot: SourceSnapshot, summary: &mut SyncSummary) -> Vec<Pre
             continue;
         }
 
+        let spanish_translations = spanish_translations_by_russian
+            .get(&source_word.russian)
+            .cloned()
+            .unwrap_or_default();
+        if spanish_translations.is_empty() {
+            summary.spanish_pending += 1;
+        } else {
+            summary.spanish_translated += 1;
+        }
+
         prepared.push(prepare_word(
             source_word,
+            spanish_translations,
             &mut translations_by_word_id,
             &aspects_by_word_id,
             &mut forms_by_word_id,
@@ -597,6 +648,7 @@ fn prepare_words(snapshot: SourceSnapshot, summary: &mut SyncSummary) -> Vec<Pre
 
 fn prepare_word(
     source_word: SourceWord,
+    spanish_translations: Vec<String>,
     translations_by_word_id: &mut HashMap<
         String,
         Vec<crate::application::ports::SourceTranslation>,
@@ -634,7 +686,7 @@ fn prepare_word(
             compare_position_nulls_last(left.position, right.position)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let translations = source_translations
+        let mut translations: Vec<Translation> = source_translations
             .into_iter()
             .filter(|translation| !translation.text.trim().is_empty())
             .map(|translation| Translation {
@@ -643,6 +695,13 @@ fn prepare_word(
                 position: translation.position,
             })
             .collect();
+        for (position, text) in spanish_translations.into_iter().enumerate() {
+            translations.push(Translation {
+                language: "es".to_owned(),
+                text,
+                position: Some(position as i64),
+            });
+        }
 
         let source_forms = forms_by_word_id.remove(&source_word.id).unwrap_or_default();
         let forms = forms_from_source(word_type.as_deref(), source_forms)?;
@@ -650,6 +709,7 @@ fn prepare_word(
         ImportedWord::new(
             source_word.id.clone(),
             source_word.russian.clone(),
+            source_word.russian_accented,
             word_type,
             aspect,
             translations,
@@ -663,6 +723,7 @@ fn prepare_word(
         Ok(word) => PreparedWord::Ready(word),
         Err(error) => PreparedWord::Invalid {
             external_id: source_word.id,
+            russian: source_word.russian,
             message: format!("{error:#}"),
         },
     }
@@ -739,6 +800,7 @@ mod tests {
             words: vec![SourceWord {
                 id: "1".to_owned(),
                 russian: "дом".to_owned(),
+                russian_accented: None,
                 source_type: Some("noun".to_owned()),
                 disabled: false,
                 audio_url: audio_url.map(str::to_owned),
