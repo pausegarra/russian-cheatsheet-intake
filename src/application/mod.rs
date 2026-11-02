@@ -1,3 +1,4 @@
+pub mod desired_state;
 pub mod ports;
 pub mod synchronize;
 pub mod synchronize_examples;

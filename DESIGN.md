@@ -8,7 +8,7 @@ Create a Rust CLI that synchronizes active OpenRussian words and linked example 
 
 ## Scope
 
-- Import `words.bare`, source word type, English translations, verb aspect, word audio URL, English usage text, and forms. Preserve null or blank source type/aspect as API null.
+- Import `words.bare` as main text and nullable `words.accented` as preserved accent text, source word type, English and Spanish translations, verb aspect, word audio URL, English usage text, and forms. Preserve null or blank source type/aspect as API null.
 - Import active OpenRussian example sentences with available English and German translations and links to imported words.
 - Import OpenRussian word relations in both directions, creating missing rows and deleting API relations absent from the source.
 - Store `sentences.id` as the API example `externalId`; use the API example UUID to update an existing sentence when its checksum changes.
@@ -18,8 +18,11 @@ Create a Rust CLI that synchronizes active OpenRussian words and linked example 
 - Buffer changed word and example writes by operation, with request size controlled by `RUSSIAN_CHEATSHEET_BATCH_SIZE`.
 - Delete imported API words, examples, and relations absent from the active OpenRussian dataset using in-memory mark-and-sweep candidates.
 - Preserve manually created words and examples without `externalId`. Delete every API relation absent from OpenRussian, including manual relations.
-- Do not generate Spanish translations in this version.
-- Preserve OpenRussian attribution and CC BY-SA licensing information in project documentation.
+- Support `--dry-run` to build the active desired source state in `desired-state.json` without Keycloak or Russian Cheatsheet API access.
+- In dry-run output, represent relation endpoints and example links with OpenRussian `externalId` values; include pending Spanish translations and preparation errors.
+- Find Spanish word translations in FreeDict RU-ES first and Kaikki/Russian Wiktionary only when FreeDict has no Spanish entry.
+- Leave Spanish absent and count the word as pending when neither dictionary has Spanish entries; do not add a separate API translation-status field.
+- Preserve OpenRussian, FreeDict, WikDict, Kaikki, and Wiktionary attribution and licensing information in project documentation.
 
 ## Source access and mapping
 
@@ -29,7 +32,7 @@ Read these tables:
 
 | Source | Mapping |
 | --- | --- |
-| `words` | `id` → external ID string; `bare` → API `russian`; `type` → API `type` or null when blank; `audio` → API `audioUrl`; `usage_en` → API `usage`; import only `disabled = false` |
+| `words` | `id` → external ID string; `bare` → API `russian`; `accented` → nullable API `russianAccented`; `type` → API `type` or null when blank; `audio` → API `audioUrl`; `usage_en` → API `usage`; import only `disabled = false` |
 | `translations` | rows with `lang = 'en'`; `tl` and source `position` → English API translations |
 | `verbs` | `word_id` and `aspect` → API `aspect`; null or blank remains null |
 | `words_forms` | `word_id`, `form_type`, `position`, `id`, and `form_bare` → API `forms`; sort by position then ID and join repeated values with `; ` |
@@ -38,13 +41,19 @@ Read these tables:
 | `sentences_translations` | nonblank `tl_en` / `tl_de` → English / German example translations at positions 0 / 1 |
 | `sentences_words` | `sentence_id` and `word_id` → source sentence links, mapped to API word UUIDs |
 
-Use `words.bare` and `words_forms.form_bare`, never their accented counterparts. Preserve word text exactly; do not trim or normalize Unicode. Send `forms: null` only when no usable source form rows exist. Send the complete API forms object with absent supported fields set to null. If forms exist but source type is blank, report that word as a sync failure because API rejects forms without a type. Preserve nullable `words.audio` and `words.usage_en` as API null.
+For each active `words.bare`, load Spanish quotes from the FreeDict Russian-Spanish TEI dictionary at `https://download.freedict.org/generated/rus-spa/rus-spa.tei`. Match TEI `form/orth` to the Russian headword and read Spanish `cit type="trans" xml:lang="es"` quote text. Only when no Spanish quote exists in FreeDict, scan the Kaikki Russian Wiktionary JSONL dump at `https://kaikki.org/dictionary/downloads/ru/ru-extract.jsonl.gz`; collect translations with Spanish `lang_code` from both entry-level and sense-level `translations`. Stream the compressed dump and retain results only for unresolved Russian headwords. Cache the compressed file under `.cache/russian-cheatsheet-intake/` and compare HTTP ETag or Last-Modified before reuse. Normalize case and Russian acute-stress marks for dictionary lookup only; preserve `words.bare` exactly in the API payload. Deduplicate Spanish results while preserving source order and assign their zero-based order as translation positions.
 
-Send an empty translations array when a word has no English translations. Word translation objects contain `language`, `text`, and source `position`; API uses array index only when position is missing. Preserve positions for display, but exclude them from the checksum. Reject unknown nonblank word types and form types instead of silently mapping or dropping them.
+Dictionary download or parse errors stop word synchronization before API word writes. They must not be interpreted as missing entries, since that could remove previously imported Spanish translations. If both dictionaries return no Spanish quotes, send no `es` translation, increment the pending count, and continue. The API stores translations but has no independent pending-translation status.
+
+Use `words.bare` for main word text and dictionary lookup; keep `words.id` as source identity and use `words_forms.form_bare` for forms. Separately preserve `words.accented` as `russianAccented`. Null, empty, or whitespace-only accent text becomes null. Preserve every nonblank accent byte, including ASCII apostrophes, Unicode representation, and surrounding spacing; never infer stress. Preserve main word text exactly; do not trim or normalize Unicode. Send `forms: null` only when no usable source form rows exist. Send the complete API forms object with absent supported fields set to null. If forms exist but source type is blank, report that word as a sync failure because API rejects forms without a type. Preserve nullable `words.audio` and `words.usage_en` as API null.
+
+Send an empty translations array when a word has no English or Spanish translations. Word translation objects contain `language`, `text`, and `position`; English positions come from OpenRussian and Spanish positions preserve dictionary result order. API uses array index only when position is missing. Preserve positions for display, but exclude them from the checksum. Reject unknown nonblank word types and form types instead of silently mapping or dropping them.
 
 Remove ASCII `'` stress markers from OpenRussian sentence Russian text before checksum calculation and API writes. Preserve translations and every other sentence character exactly. The source does not include contributor or sentence audio fields; send null. Remove repeated links and map only word IDs present in the API word map. Skip a sentence if no linked word maps to an API UUID. The API stores the OpenRussian sentence ID in a nullable, unique `externalId`; manually created examples have null identity.
 
 ## API synchronization
+
+With `--dry-run`, skip the API client, token acquisition, API reads, writes, and delete reconciliation. Load complete OpenRussian word, relation, and example snapshots, prepare words through the same mapper as API sync, resolve Spanish translations, and write an atomic JSON snapshot in the current directory. JSON includes API-compatible sparse word requests, relations and example links expressed with OpenRussian `externalId`, pending Spanish languages, preparation errors, and counts. Omit null-valued optional properties and empty form slots; API record deserialization gives omitted properties null values. Disabled entries and active examples with no included word links are omitted. Validation errors stay in the output file and cause a failure exit status. Source download or serialization failures leave any prior output file intact.
 
 Fetch every page from `GET /api/v1/words` and build an in-memory map keyed by `externalId`, storing API `id` and `checksum`. `externalId` is the OpenRussian `words.id` and is the identity key; Russian text and checksum are not identity keys. This handles homographs and identical payloads with distinct OpenRussian IDs.
 
@@ -66,25 +75,26 @@ The same service account also needs `examples#create`, `examples#update`, and `e
 
 Keep one API `checksum` per imported word; define it as the canonical checksum of OpenRussian-managed word fields. Relations have dedicated endpoints and must not affect this checksum. Relation creation/deletion must not refresh a word checksum.
 
-The Rust implementation must match the API's canonical word payload. It includes `russian`, `type`, imported translations, `usage`, `audioUrl`, `aspect`, and `forms`; it excludes relations. Each checksum translation contains only `language` and `text`; position remains in stored API data but is not hashed. Sort checksum translations by language, then text, preserving duplicate entries. Serialize compact UTF-8 JSON with sorted property names and null values included, then calculate lowercase SHA-256 hex. Match Jackson's uppercase hexadecimal digits in `\u` escapes for control characters, or hashes diverge for those words. The hash does not include `externalId`, API UUID, audit timestamps, publication state, relations, translation positions, or the checksum itself.
+The Rust implementation must match the API's canonical word payload. It includes `russian`, nullable `russianAccented`, `type`, imported English and Spanish translations, `usage`, `audioUrl`, `aspect`, and `forms`; it excludes relations. Each checksum translation contains only `language` and `text`; position remains in stored API data but is not hashed. Sort checksum translations by language, then text, preserving duplicate entries. Serialize compact UTF-8 JSON with sorted property names and null values included, then calculate lowercase SHA-256 hex. Match Jackson's uppercase hexadecimal digits in `\u` escapes for control characters, or hashes diverge for those words. The hash does not include `externalId`, API UUID, audit timestamps, publication state, relations, translation positions, or the checksum itself.
 
 For this version, the expected API projection is:
 
 - `russian`: `words.bare`
+- `russianAccented`: exact nonblank `words.accented`, or null when absent or blank
 - `type`: source `words.type`, or null when source type is blank
-- `translations`: English source rows only
+- `translations`: English OpenRussian rows plus Spanish FreeDict rows, with Kaikki/Wiktionary rows only for FreeDict misses
 - `aspect`: nonblank `verbs.aspect` for verbs; null when absent
 - `forms`: complete source-native form object, or null when absent
 - `usage`: `words.usage_en`
 - `audioUrl`: `words.audio`
 
-Manual translations are preserved by the API and excluded from its checksum. Relations remain independently managed and can change without changing a word checksum. A translation position-only change will not trigger an update; displayed translation ordering may therefore remain unchanged. The API checksum projection already includes forms, usage, and audio URL, so changes to these source fields trigger intake updates.
+Manual translations are preserved by the API and excluded from its checksum. Relations remain independently managed and can change without changing a word checksum. A translation position-only change will not trigger an update; displayed translation ordering may therefore remain unchanged. The API checksum projection includes accent text, forms, usage, and audio URL, so changes to these source fields trigger intake updates. `russianAccented` follows `russian` in canonical alphabetical property order, including when null. Accent-only changes keep existing source and API identities.
 
 Example checksums cover Russian text, translations including language/text/position, contributor, audio URL, and sorted linked API word UUIDs. They exclude `externalId`, API UUID, audit fields, and checksum itself. Compare by `externalId` first, then checksum: source identity remains stable while sentence text, translations, or word links change.
 
 ## Error handling and reporting
 
-CSV export/download, CSV decoding, and API writes or deletes must fail visibly on unrecoverable HTTP or validation errors. Never sweep after an incomplete source or API read. Emit timestamped INFO logs for complete source table exports, API page progress, each word and relation write/delete outcome, each example outcome including disabled/unlinked skips, and final counts. Emit ERROR logs for failed writes/deletes and DEBUG logs for request starts and cached-token reuse. Report scanned, disabled-skipped, unlinked-skipped, created, updated, unchanged, deleted, and failed counts. Do not convert unknown source types into `other`.
+CSV, FreeDict, and Kaikki download/parse failures and API writes or deletes must fail visibly on unrecoverable HTTP or validation errors. Never sweep after an incomplete source or API read. Emit timestamped INFO logs for complete source table exports, API page progress, dictionary fallback outcomes, each word and relation write/delete outcome, each example outcome including disabled/unlinked skips, and final counts. Emit ERROR logs for failed writes/deletes and DEBUG logs for request starts and cached-token reuse. Report scanned, disabled-skipped, Spanish-translated, Spanish-pending, unlinked-skipped, created, updated, unchanged, deleted, and failed counts. Do not convert unknown source types into `other`.
 
 ## Verification scope
 

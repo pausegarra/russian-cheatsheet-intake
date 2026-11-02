@@ -394,7 +394,7 @@ fn prepare_candidates(
     candidates
 }
 
-fn desired_relation_keys(
+pub(crate) fn desired_relation_keys(
     relations: &[SourceWordRelation],
     active_source_word_ids: &HashSet<String>,
 ) -> HashSet<WordRelationKey> {

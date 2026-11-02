@@ -134,6 +134,9 @@ impl WordSource for OpenRussianClient {
             source_words.push(SourceWord {
                 id: row.string("words", "id")?,
                 russian: row.string("words", "bare")?,
+                russian_accented: row
+                    .optional_string("words", "accented")?
+                    .filter(|value| !value.trim().is_empty()),
                 source_type: row.optional_string("words", "type")?,
                 disabled: row.boolean("words", "disabled")?,
                 audio_url: row.optional_string("words", "audio")?,
@@ -488,6 +491,177 @@ impl TableRow {
 
 #[cfg(test)]
 mod tests {
+    use crate::application::desired_state;
+    use crate::application::ports::{
+        SourceExampleSnapshot, SourceWordRelationSnapshot, WordSource,
+    };
+    use crate::application::synchronize::{
+        PreparedWord, SyncSummary, prepare_words_with_spanish_translations,
+    };
+    use crate::domain::word::ImportedWord;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn snapshot_with_accent(accent: &str) -> crate::application::ports::SourceSnapshot {
+        let csv = format!(
+            "id,bare,accented,type,disabled,audio,usage_en\n1,привет,\"{accent}\",noun,0,,\n"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local fixture server binds");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let tables = [
+                ("words", csv.as_str()),
+                ("translations", "id,word_id,position,tl\n"),
+                ("verbs", "word_id,aspect\n"),
+                ("words_forms", "word_id,id,position,form_type,form_bare\n"),
+            ];
+            for (table, csv) in tables {
+                for export in [true, false] {
+                    let (mut connection, _) = listener.accept().unwrap();
+                    connection
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        connection.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let body = if export {
+                        assert!(request.starts_with("POST "));
+                        assert!(request.contains(&format!("/tables/{table}/export?")));
+                        format!(r#"{{"result":{{"exportKey":"{table}"}}}}"#)
+                    } else {
+                        assert!(request.starts_with(&format!("GET /exports/{table} ")));
+                        csv.to_owned()
+                    };
+                    write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let client = super::OpenRussianClient {
+            http: reqwest::blocking::Client::new(),
+            worker_url: url::Url::parse(&format!("http://{address}")).unwrap(),
+            connection_id: "test".to_owned(),
+            database_name: "openrussian".to_owned(),
+        };
+        let snapshot = client.load_snapshot().expect("source CSV loads");
+        server.join().expect("fixture server completes");
+        snapshot
+    }
+
+    fn prepared_with_accent(accent: &str) -> ImportedWord {
+        let mut words = prepare_words_with_spanish_translations(
+            snapshot_with_accent(accent),
+            &mut SyncSummary::default(),
+            &HashMap::new(),
+        );
+        match words.pop().expect("one source word") {
+            PreparedWord::Ready(word) => word,
+            PreparedWord::Invalid { message, .. } => panic!("valid source word: {message}"),
+        }
+    }
+
+    #[test]
+    fn source_accent_survives_create_and_update_requests_exactly() {
+        for accent in [
+            "  приве'т  ",
+            "приве\u{301}т",
+            "й ё и\u{306} е\u{308}",
+            "\u{1c}",
+            "\u{1f}",
+            "\u{feff}",
+        ] {
+            let word = prepared_with_accent(accent);
+            let create = serde_json::to_value(word.request()).unwrap();
+            let update = serde_json::to_value(word.update_request("api-word-id")).unwrap();
+            assert_eq!(create["russian"], "привет");
+            assert_eq!(create["externalId"], "1");
+            assert_eq!(create["russianAccented"], accent);
+            assert_eq!(update["russianAccented"], accent);
+            assert_eq!(update["id"], "api-word-id");
+        }
+    }
+
+    #[test]
+    fn source_blank_accent_serializes_as_null() {
+        for accent in ["", " \t\u{2003} ", "\u{a0}", "\u{85}", "\u{2007}", "\u{202f}"] {
+            assert_eq!(snapshot_with_accent(accent).words[0].russian_accented, None);
+            let word = prepared_with_accent(accent);
+            let request = serde_json::to_value(word.request()).unwrap();
+            let update = serde_json::to_value(word.update_request("api-word-id")).unwrap();
+            assert_eq!(
+                request.get("russianAccented"),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(update["russianAccented"], serde_json::Value::Null);
+            assert_eq!(word.checksum, prepared_with_accent("").checksum);
+        }
+    }
+
+    #[test]
+    fn accent_only_change_changes_checksum() {
+        let baseline = prepared_with_accent("приве'т");
+        let changed = prepared_with_accent("при'вет");
+        let missing = prepared_with_accent("");
+        assert_eq!(baseline.russian, changed.russian);
+        assert_eq!(baseline.external_id, changed.external_id);
+        assert_ne!(baseline.checksum, changed.checksum);
+        assert_ne!(baseline.checksum, missing.checksum);
+    }
+
+    #[test]
+    fn source_accent_survives_dry_run_with_bare_spanish_lookup() {
+        let accent = "  приве'т\u{301}  ";
+        let state = desired_state::build(
+            snapshot_with_accent(accent),
+            SourceWordRelationSnapshot::default(),
+            SourceExampleSnapshot::default(),
+            &HashMap::from([("привет".to_owned(), vec!["hola".to_owned()])]),
+        )
+        .expect("desired state builds");
+        assert_eq!(state.words[0]["russianAccented"], accent);
+        assert_eq!(state.words[0]["russian"], "привет");
+        assert_eq!(state.words[0]["translations"][0]["text"], "hola");
+        assert_eq!(state.summary.words_spanish_translated, 1);
+        assert_eq!(state.pending_translations.len(), 0);
+    }
+
+    #[test]
+    fn accented_checksum_matches_shared_api_fixture() {
+        let fixture = include_bytes!("../../tests/fixtures/accented-word-checksum.json");
+        let expected = "ede401cee0fb553c48cfdaf9cdd67e963c4de642247a431c86a20c598387e0c5";
+        assert_eq!(format!("{:x}", Sha256::digest(fixture)), expected);
+        assert_eq!(prepared_with_accent("приве'т").checksum, expected);
+    }
+
+    #[test]
+    fn control_accent_checksum_matches_shared_api_fixture() {
+        let fixture = include_bytes!("../../tests/fixtures/accented-word-control-checksum.json");
+        let expected = "89014dd7dcb65e19bed20ca3244ad09856f26bcdb64d4280711a7832d4b2c14d";
+        assert_eq!(format!("{:x}", Sha256::digest(fixture)), expected);
+        assert_eq!(prepared_with_accent("\u{1c}").checksum, expected);
+    }
+
+    #[test]
+    fn optional_accent_accepts_null_and_preserves_nonblank_strings() {
+        let mut row = super::TableRow {
+            columns: std::sync::Arc::new(vec!["accented".to_owned()]),
+            values: vec![serde_json::Value::Null],
+            source_row: 2,
+        };
+        assert_eq!(row.optional_string("words", "accented").unwrap(), None);
+        let exact = "  приве'т\u{301}  ";
+        row.values[0] = serde_json::Value::String(exact.to_owned());
+        assert_eq!(
+            row.optional_string("words", "accented").unwrap().as_deref(),
+            Some(exact)
+        );
+    }
+
     #[test]
     fn allows_ten_minutes_for_large_csv_downloads() {
         assert_eq!(

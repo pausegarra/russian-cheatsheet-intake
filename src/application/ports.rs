@@ -14,6 +14,7 @@ pub struct SourceSnapshot {
 pub struct SourceWord {
     pub id: String,
     pub russian: String,
+    pub russian_accented: Option<String>,
     pub source_type: Option<String>,
     pub disabled: bool,
     pub audio_url: Option<String>,
@@ -148,6 +149,13 @@ pub trait WordSource {
     fn load_word_relation_snapshot(&self) -> Result<SourceWordRelationSnapshot> {
         Ok(SourceWordRelationSnapshot::default())
     }
+}
+
+pub trait SpanishTranslationSource {
+    fn find_spanish_translations(
+        &self,
+        russian_words: &[String],
+    ) -> Result<HashMap<String, Vec<String>>>;
 }
 
 pub trait WordsApi {

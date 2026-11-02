@@ -1,10 +1,12 @@
 # Russian Cheatsheet Intake
 
-Rust CLI that syncs active OpenRussian words, word relations, and linked example sentences to Russian Cheatsheet API. It creates missing records, skips records that already match, and updates changed words and examples. It uses mark-and-sweep reconciliation: active source identities are removed from in-memory API deletion candidates, and remaining candidates are deleted after a complete pass. Words sync first, then relations and examples; stale words are deleted last.
+Rust CLI that syncs active OpenRussian words, Spanish word translations, word relations, and linked example sentences to Russian Cheatsheet API. It creates missing records, skips records that already match, and updates changed words and examples. It uses mark-and-sweep reconciliation: active source identities are removed from in-memory API deletion candidates, and remaining candidates are deleted after a complete pass. Words sync first, then relations and examples; stale words are deleted last.
 
 Disabled OpenRussian words and sentences are outside the active dataset, so their imported API records are deleted. Manual words and examples without `externalId` are preserved. Relations have no source marker; every API relation absent from OpenRussian is deleted, including manually created relations.
 
-Word intake maps `words.audio` to `audioUrl`, `words.usage_en` to `usage`, and `words_forms.form_bare` to source-named API forms. Repeated forms with the same `form_type` are sorted by source position and row ID, then joined with `; `. Word translation objects contain `language`, `text`, and `position`; `managedBy` is internal to the API. Blank types and aspects stay null; unsupported types and form types fail visibly. Manual API translations remain API-managed.
+Word intake keeps `words.bare` as `russian` and separately preserves `words.accented` as nullable `russianAccented`. Nonblank accent text keeps its exact apostrophes, Unicode representation, and spacing; null, empty, and whitespace-only accents become null. Accent-only changes update the word checksum without changing source identity, dictionary lookup, or main text. Word intake maps `words.audio` to `audioUrl`, `words.usage_en` to `usage`, and `words_forms.form_bare` to source-named API forms. Repeated forms with the same `form_type` are sorted by source position and row ID, then joined with `; `. Word translation objects contain `language`, `text`, and `position`; `managedBy` is internal to the API. Blank types and aspects stay null; unsupported types and form types fail visibly. Manual API translations remain API-managed.
+
+Spanish word translations use FreeDict Russian-Spanish as the primary source. Intake looks up each active Russian headword in the FreeDict TEI dictionary and adds its Spanish entries with language `es`, preserving source order. It consults the Kaikki Russian Wiktionary JSONL dump only for headwords with no FreeDict Spanish entries. The compressed Kaikki dump is streamed and cached under `.cache/russian-cheatsheet-intake/`; HTTP validators refresh the cache when the upstream file changes. If neither source has Spanish entries, intake leaves Spanish absent, counts the word as pending, and continues syncing. The API has no separate translation status field.
 
 Example intake maps `sentences.id` to API `externalId`, `sentences.ru` to `russian` after removing ASCII apostrophe stress markers, nonblank `tl_en` / `tl_de` to English / German translations, and `sentences_words.word_id` to linked API word UUIDs. Marker removal happens before checksum calculation and API writes. Translation positions are 0 for English and 1 for German. The source has no sentence audio or contributor fields, so both API values are null. A matching `externalId` with changed content is updated by API UUID; unchanged checksum skips the write. Active examples without links to imported API words are preserved and skipped. Disabled or removed source sentences are deleted from the API. Intake uses `GET /api/v1/examples?externalIdOnly=true` to read only IDs and checksums when building its reconciliation map.
 
@@ -22,6 +24,14 @@ cp .env.example .env
 cargo run --release
 ```
 
+Pass `--dry-run` to build the desired state without Russian Cheatsheet API or Keycloak access:
+
+```sh
+cargo run --release -- --dry-run
+```
+
+Dry-run writes or atomically replaces `desired-state.json` in the current directory. File includes importable words, relations, examples, Spanish translations still pending, validation errors, and summary. Nonblank `russianAccented` uses the same word payload as API create/update. Null-valued optional word fields and empty form slots are omitted for readability; API treats missing record fields as null. Relation endpoints and example links use OpenRussian `externalId` values because no API UUIDs are fetched. Disabled entries and examples without an included word link are omitted. A validation error still produces the file and makes the command exit with failure; inspect its `errors` field. Dry-run needs no Russian Cheatsheet API URL or Keycloak credentials.
+
 Set `RUSSIAN_CHEATSHEET_API_URL` to the API root, such as `http://localhost:8080/api`. Intake appends `/v1` to each API route.
 
 `RUSSIAN_CHEATSHEET_BATCH_SIZE` sets each create, update, or delete batch threshold; default is `1000`. Intake uses five write buffers: word creates, word updates, relation creates, example creates, and example updates. Deletes use `DELETE /api/v1/words/batch`, `DELETE /api/v1/words/relations/batch`, and `DELETE /api/v1/examples/batch`. Word writes finish before relation and example reconciliation so links use returned word UUIDs. Stale relation and example batches finish before stale word batches. Configure the API's `app.batch.max-size` to accept the chosen intake threshold; intake does not cap it. The API relation listing accepts up to 1000 items per page.
@@ -34,6 +44,10 @@ The process environment overrides values from `.env`. Set `OPENRUSSIAN_TOGETHERD
 
 The source uses TogetherDB's public worker export endpoints: one complete CSV export per table, followed by download using its export key. These endpoints serve TogetherDB's web client and are not documented as a stable third-party API, so a TogetherDB change may require updating the source adapter.
 
+Spanish dictionaries are fetched only during word synchronization. FreeDict TEI and Kaikki JSONL download or parse failures stop intake before word writes; they are not treated as missing translations.
+
 ## OpenRussian data
 
 OpenRussian dictionary data is licensed CC BY-SA 4.0. Source: [OpenRussian dictionary data](https://en.openrussian.org/dictionary-data). Keep this attribution with redistributed data and publish modifications under the same license.
+
+FreeDict Russian-Spanish is available from the [FreeDict downloads](https://freedict.org/downloads/) and [generated TEI](https://download.freedict.org/generated/rus-spa/rus-spa.tei); its dictionary metadata credits WikDict and Wiktionary/DBnary and identifies CC BY-SA 3.0. Kaikki fallback uses [Russian Wiktionary data](https://kaikki.org/dictionary/rawdata.html). Preserve attribution and follow each source's license; Wikimedia says most text is CC BY-SA 4.0 and GFDL in its [reuse guidance](https://foundation.wikimedia.org/wiki/Legal:Wikimedia_Developer_App_Guidelines).
